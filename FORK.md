@@ -136,7 +136,7 @@
    - `client.ts`：`GroupsPage` + `SessionsByUserPage` + `settings.section` 注册
      （`id: 'auth-groups'`, `order: 32`；`id: 'auth-sessions'`, `order: 33`）。
 3. `npm test` 必须全绿：上游 145 项安全断言 + `modern-policy` 19 例 + 本包新增 46 例
-   （spaces 13 / group-store 9 / group-policy 16 / session-transcript 8）+ 宿主集成 158 项。
+   （spaces 13 / group-store 9 / group-policy 16 / session-transcript 8）+ 宿主集成 161 项。
 
 未接线组功能时（组表为空、归属表里没有任何组绑定）行为与上游一致：一切都是私有的，
 这条由 `test/group-policy.test.mjs` 的「未接线组功能时行为与上游一致」用例固化。
