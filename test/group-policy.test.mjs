@@ -11,6 +11,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createModernPolicy } from '../lib/modern-policy.js'
+import { confinePath } from '../lib/spaces.js'
 
 const alice = { username: 'alice', role: 'user' }
 const bob = { username: 'bob', role: 'user' }
@@ -60,9 +61,10 @@ const correlation = () => ({ events: new Set() })
 test('读：组工作区里的会话对组内成员可读（page / follow / 文件预览）', async () => {
   assert.equal(await policy.authorize(alice, 'session/page', request({ address: { kind: 'session', sessionId: 's1' } })), true)
   assert.equal(await policy.authorize(bob, 'session/follow', request({ address: { kind: 'session', sessionId: 's1' } }), true), true)
-  assert.equal(await policy.authorize(bob, 'workspaceFiles/read', { args: { workspaceFileScopeId: 's1' } }), true)
-  assert.equal(await policy.authorize(bob, 'workspaceFiles/changes', { args: { workspaceFileScopeId: 's1' } }, true), true)
-  assert.equal(await policy.authorize(bob, 'officeToPdf/render', { args: { workspaceFileScopeId: 's1' } }), true)
+  const inWs = { args: { workspaceFileScopeId: 's1', path: '/srv/spaces/groups/wg1/notes.md' } }
+  assert.equal(await policy.authorize(bob, 'workspaceFiles/read', inWs), true)
+  assert.equal(await policy.authorize(bob, 'workspaceFiles/changes', inWs, true), true)
+  assert.equal(await policy.authorize(bob, 'officeToPdf/render', { args: { workspaceFileScopeId: 's1', path: 'notes.md' } }), true)
   // 自己的照旧
   assert.equal(await policy.authorize(alice, 'session/page', request({ address: { kind: 'session', sessionId: 'a' } })), true)
 })
@@ -220,6 +222,45 @@ test('result：fork 继承源会话的工作区与组（源会话不因后续改
   assert.deepEqual(bound[1], ['fork-2', 'wp-a', undefined])
 })
 
+// ── 工作区文件读取的路径收敛（0.8.0 安全加固） ──
+
+test('文件收敛：接线后普通用户只能读会话工作区内的文件', async () => {
+  // 与 index.ts 接线一致的收敛实现：会话自己的工作区根 + confinePath
+  const workspaceRoots = { s1: '/srv/spaces/groups/wg1', a: '/srv/spaces/users/alice', b: '/srv/spaces/users/bob' }
+  const confine = (viewer, sessionId, path, baseFile) => {
+    const root = workspaceRoots[sessionId]
+    return root !== undefined && confinePath(root, path, baseFile) !== undefined
+  }
+  const confined = createModernPolicy(owners, { confinePaths: confine })
+  const read = (who, scope, path, baseFile) => confined.authorize(who, 'workspaceFiles/read', { args: { workspaceFileScopeId: scope, path: path, ...(baseFile === undefined ? {} : { baseFile: baseFile }) } })
+  // 工作区内 → 放行（自己的私有空间、自己的组会话）
+  assert.equal(await read(bob, 'b', '/srv/spaces/users/bob/notes.md'), true)
+  assert.equal(await read(bob, 's1', '/srv/spaces/groups/wg1/docs/a.md'), true)
+  assert.equal(await read(bob, 's1', 'docs/a.md'), true)
+  // 越界 → 拒绝（凭据文件、别人的私有空间、同前缀的兄弟目录）
+  assert.equal(await read(bob, 'b', '/srv/spaces/users/bob/../alice/secret.md'), false)
+  assert.equal(await read(bob, 'b', '/Users/x/.dsh/.credentials.yaml'), false)
+  assert.equal(await read(bob, 's1', '/srv/spaces/groups/wg1-evil/x.md'), false)
+  // 相对路径以 baseFile 所在目录为基准，也要收敛
+  assert.equal(await read(bob, 's1', '../../wg2/secret.md', '/srv/spaces/groups/wg1/docs/a.md'), false)
+  // 缺 path / 缺 scope / 回调抛错 → 拒绝（fail-closed）
+  assert.equal(await confined.authorize(bob, 'workspaceFiles/read', { args: { workspaceFileScopeId: 's1' } }), false)
+  assert.equal(await confined.authorize(bob, 'workspaceFiles/read', { args: { workspaceFileScopeId: 'unknown-scope', path: 'x' } }), false)
+  const broken = createModernPolicy(owners, { confinePaths: () => { throw new Error('registry down') } })
+  assert.equal(await broken.authorize(bob, 'workspaceFiles/read', { args: { workspaceFileScopeId: 's1', path: 'a.md' } }), false)
+  // 管理员不受限
+  const adminRead = await confined.authorize(root, 'workspaceFiles/read', { args: { workspaceFileScopeId: 'b', path: '/etc/hosts' } })
+  assert.equal(adminRead, true)
+  // 流式 changes 同样收敛
+  assert.equal(await confined.authorize(bob, 'workspaceFiles/changes', { args: { workspaceFileScopeId: 's1', path: '/etc/hosts' } }, true), false)
+  assert.equal(await confined.authorize(bob, 'workspaceFiles/changes', { args: { workspaceFileScopeId: 's1', path: '/srv/spaces/groups/wg1/a' } }, true), true)
+  // officeToPdf 的位置参数形态也要收敛
+  const positional = { args: ['s1', '/srv/spaces/groups/wg1/a.docx', 0] }
+  assert.equal(await confined.authorize(bob, 'officeToPdf/render', positional), true)
+  const escape = { args: ['s1', '/etc/shadow', 0] }
+  assert.equal(await confined.authorize(bob, 'officeToPdf/render', escape), false)
+})
+
 // ── fail-closed 与兼容 ──
 
 test('fail-closed：组查询抛错 → 无组（私有），绝不退化成组内可读', async () => {
@@ -244,4 +285,6 @@ test('未接线组功能时行为与上游一致（一切都是私有的）', as
   assert.equal(await baseline.authorize(alice, 'session/prompt', request({ sessionId: 'a' })), true)
   assert.equal(await baseline.authorize(alice, 'session/prompt', request({ sessionId: 's2' })), false)
   assert.equal(await baseline.authorize(alice, 'session/create', request({ workspaceId: 'wg1' })), false)
+  // 未接线路径收敛（confinePaths 缺省）时工作区文件读取保持上游行为
+  assert.equal(await baseline.authorize(alice, 'workspaceFiles/read', { args: { workspaceFileScopeId: 'a', path: '/etc/hosts' } }), true)
 })

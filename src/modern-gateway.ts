@@ -74,6 +74,11 @@ export interface ModernAuth {
   claimWorkspace(id: string, username: string): Promise<void>
   bindSession(id: string, workspaceId: string | undefined, groupId: string | undefined): Promise<void>
   /**
+   * 普通用户的工作区文件读取必须落在该会话的工作区内（宿主 `workspaceFiles/*` 不限制路径）。
+   * 未接线时保持上游行为。
+   */
+  confinePaths?(principal: Principal, sessionId: string, path: string, baseFile: string | undefined): Promise<boolean> | boolean
+  /**
    * R2：按登录用户返回模型授权范围（provider + 逐模型）。返回 undefined 表示不裁剪；
    * 管理员在策略层直接绕过，不会走到这里。
    */
@@ -240,6 +245,7 @@ function errorMessage(error: unknown): string {
 export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth): ModernGateway {
   const policy: ModernPolicy = createModernPolicy(auth, {
     ...(auth.entitlement === undefined ? {} : { entitlement: auth.entitlement }),
+    ...(auth.confinePaths === undefined ? {} : { confinePaths: auth.confinePaths }),
   })
   const policies = new Map<string, PolicyRules>()
   const principalByRequest = new WeakMap<IncomingMessage, Principal>()
@@ -273,18 +279,30 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
     return matches[0]?.[kind]
   }
 
+  /**
+   * The single `sessionId` of a query-addressed route.
+   *
+   * 宿主用 `Object.fromEntries(url.searchParams)` 取值 —— **重复参数取最后一个**，
+   * 而 `get()` 取第一个。两者分叉会让「检查 A 的会话、导出 B 的会话」成为可能，
+   * 所以重复参数一律视为非法（fail-closed）。
+   */
+  function querySessionId(url: URL): string | undefined {
+    const values = url.searchParams.getAll('sessionId')
+    return values.length === 1 && nonempty(values[0]) ? values[0] : undefined
+  }
   /** Own a `sessionId` query parameter on the read-side `/api` routes that bypass Remote dispatch. */
   function ownsQuerySession(who: Principal, url: URL): boolean {
     // 与 Remote 面同一套读谓词：管理员、归属人本人，以及组会话的组内成员。
-    return policy.session(who, url.searchParams.get('sessionId'))
+    const sessionId = querySessionId(url)
+    return sessionId !== undefined && policy.session(who, sessionId)
   }
   /**
    * Write-side query session (binary upload stages bytes under the addressed session).
    * 与 Remote 面的 `fileUploads/upload` 同一谓词：**仅归属人本人**（组内可读不等于可写）。
    */
   function ownsQuerySessionWrite(who: Principal, url: URL): boolean {
-    const sessionId = url.searchParams.get('sessionId')
-    return nonempty(sessionId) && auth.session(sessionId) === who.username
+    const sessionId = querySessionId(url)
+    return sessionId !== undefined && auth.session(sessionId) === who.username
   }
 
   function prepare(req: IncomingMessage): { status: number } | { who: Principal; carrier?: string; status?: undefined } {

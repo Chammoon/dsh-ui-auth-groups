@@ -28,7 +28,17 @@
 5. **管理员：按用户浏览会话**增强：列表与详情带组名/工作区 id，面板支持按组筛选（含「私有（无组）」）。
 6. **`adminProvisionWorkspaces` 等 6 个空间 RPC**，全部经 `requireAdmin()` 或登录门禁并写审计；
    归属表升到 **v2**（`workspaceGroups` / `sessionGroups` / `sessionWorkspaces` / `privateWorkspaces`），
-   v1 可原地升级。
+   v1 可原地升级（旧数据 = 无组 = 私有，只收紧不放宽）。
+7. **工作区文件读取收敛（安全加固）**：宿主 `workspaceFiles/read|readBytes|stat` 不限制路径
+   （文档明说工作区外的文件也允许读），只有 `list` 做包含性校验 —— 结果任何登录用户都能读到
+   `~/.dsh/.credentials.yaml`、别人的私有空间与会话日志。现在普通用户的文件读取必须落在
+   **该会话自己的工作区**内（绝对/相对/`baseFile`/`..`/同前缀兄弟目录都做规范化，判不出来一律拒绝），
+   管理员不受限，`DSH_AUTH_CONFINE_FILES=0` 可关闭；工作区内指向外部的**符号链接**仍是已知残余。
+8. **`/api/session.export` 的重复 `sessionId` 一律拒绝**：宿主用 `Object.fromEntries` 取最后一个，
+   网关用 `get()` 取第一个，两边分叉就能「检查 A 的会话、导出 B 的会话」。
+   `/api/session/uploadFileBinary` 明确按**写**面处理：仅归属人本人（管理员对他人会话同样只读）。
+9. **私有空间目录名去重**：`alice-` / `alice.` / `.alice` 这类用户名清洗后会撞进同一目录，
+   现按「清洗结果 ≠ 原样」追加短哈希，避免抢先占位导致他人供给失败。
 
 **兼容**
 

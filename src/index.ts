@@ -21,6 +21,7 @@ import { GroupStore } from './group-store.js'
 import type { GroupRecord } from './group-store.js'
 import {
   SpaceProvisioner,
+  confinePath,
   describeSpaceWorkspace,
   listSpaceWorkspaces,
   readSpaceConfig,
@@ -1263,10 +1264,17 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
     // ============ 私有空间 / 组工作区（无组 = 私有，组 = 项目空间） ============
     // 目录布局见 src/spaces.ts；工作区记录本身由宿主 workspaceRegistry 持有（DSH 侧栏
     // 显示的就是它），本插件只负责「建目录 + 登记归属 + 绑定组」。
-    const SPACES = readSpaceConfig(typeof process !== 'undefined' && process.env !== undefined ? process.env : {})
+    const PROVISION_ENV = typeof process !== 'undefined' && process.env !== undefined ? process.env : {}
+    const SPACES = readSpaceConfig(PROVISION_ENV)
     // 首次登录会给该用户建目录 + 注册工作区（约几十毫秒）；已供给过的用户走内存命中，
     // 不再有任何 IO。超过这个上限就放行登录、供给继续在后台完成（绝不拖住登录）。
     const PROVISION_TIMEOUT_MS = 800
+    // 工作区文件读取收敛（0.8.0 安全加固）：宿主 `workspaceFiles/read|readBytes|stat` 接受任意
+    // 绝对路径（其文档明说工作区外的文件也允许读），普通用户只要有一个会话就能读到
+    // `~/.dsh/.credentials.yaml`、别人的私有空间与会话日志。默认按「会话自己的工作区」收敛，
+    // 需要回到上游行为时设 DSH_AUTH_CONFINE_FILES=0。
+    const CONFINE_FILES = !['0', 'false', 'off', 'no'].includes(
+      String(PROVISION_ENV.DSH_AUTH_CONFINE_FILES ?? '').trim().toLowerCase())
     const workspaceRegistry = (): WorkspaceRegistryLike | undefined => ctx.get('workspaceRegistry') as WorkspaceRegistryLike | undefined
     const provisioner = new SpaceProvisioner({
       get registry() { return workspaceRegistry() },
@@ -3565,6 +3573,16 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
           claimSession: setSessionOwner,
           claimWorkspace: setWorkspaceOwner,
           bindSession,
+          confinePaths(principal: Principal, sessionId: string, path: string, baseFile: string | undefined) {
+            if (!CONFINE_FILES) return true
+            // 只认「该会话创建时所在工作区」：没有记录（例如 CLI 直接建的会话）= 无法证明 →
+            // 拒绝（ordinary 用户本来也读不到未登记的会话）。
+            const workspaceId = state.owners.sessionWorkspaces.get(sessionId)
+            if (workspaceId === undefined) return false
+            const described = describeSpaceWorkspace(workspaceRegistry(), workspaceId)
+            if (described === undefined || described.path === '') return false
+            return confinePath(described.path, path, baseFile) !== undefined
+          },
           // R2：普通用户可见的模型 = 自有配置 + 收到的分享。管理员由策略层直接绕过。
           // 从未配置任何模型的用户得到空授权（目录为空、切换模型被拒）——这就是 Q2 的"阻断使用"。
           // 这里只读元数据（provider/model），不需要解锁，也不接触任何 Key。

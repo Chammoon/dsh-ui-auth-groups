@@ -67,6 +67,7 @@
 |---|---|---|
 | `DSH_AUTH_WORKSPACES_DIR` | `<DSH_HOME>/spaces`（`DSH_HOME` 缺省为 `~/.dsh`） | 私有空间与组工作区的根目录 |
 | `DSH_AUTH_PROVISION` | 开 | `0` / `false` / `off` / `no` 关闭登录时的自动供给（管理员仍可显式创建） |
+| `DSH_AUTH_CONFINE_FILES` | 开 | `0` / `false` / `off` / `no` 关闭「工作区文件读取收敛」（普通用户将可读进程可读的任意文件，仅在对内全信任的部署里才应关闭） |
 | `DSH_HOME` | `~/.dsh` | 未显式指定根目录时的父目录 |
 
 登录时的供给**不阻塞登录**：已供给过的用户走内存命中；首次供给最多等 800ms，超时即放行、
@@ -74,21 +75,45 @@
 
 ## 改动清单
 
-上游文件内的改动共 1,313 行新增 / 94 行删除（客户端含面板重写）；另有 4 个新增源文件与 5 个新增测试文件。
+上游文件内的改动共 1,469 行新增 / 100 行删除（客户端含面板重写）；另有 4 个新增源文件与 5 个新增测试文件。
 
 | 文件 | 改动 | 量级 |
 |---|---|---|
-| `src/spaces.ts` | **新增**：私有空间/组工作区的目录推导（路径穿越防护）与供给（`workspaceRegistry` + mkdir + 归属登记），全部依赖可注入 | 216 行 |
+| `src/spaces.ts` | **新增**：私有空间/组工作区的目录推导（路径穿越 + 目录名去重）与供给（`workspaceRegistry` + mkdir + 归属登记），以及文件读取收敛用的 `confinePath()`；依赖全部可注入 | 272 行 |
 | `src/group-store.ts` | **新增**：组存储（原子落盘、防抖、损坏隔离、`isMember()` 同步索引） | 300 行 |
 | `src/session-transcript.ts` | **新增**：会话事件流 → 只读转录（纯函数：正文提取、标题折叠、按归属分组 + 组/工作区标注） | 226 行 |
-| `src/modern-policy.ts` | 谓词按「对象所属组」判定：`session` / `workspace` 读谓词 + `sessionWrite` / `workspaceWrite` / `workspaceManage` 分离；`conversationWriteTarget()` 把「仅本人可写」提到**管理员直通之前**；`result(..., payload)` 在建会话/fork 时冻结工作区与组绑定 | 180 行 |
-| `src/modern-gateway.ts` | `ModernAuth` 增加组查询/绑定接缝；`policy.result` 传入请求 payload；直连路由拆分：`/api/session.export` 用策略**读**谓词（组内可读），`/api/session/uploadFileBinary` 仍是**仅归属人**（组内可读 ≠ 可写） | 16 行 |
-| `src/index.ts` | 归属表 v2（组绑定/私有空间）+ 串行化写入与回滚；空间供给接线；登录/注册时供给；6 个组 RPC + **6 个工作区/空间 RPC**；**2 个会话浏览 RPC**；标题 TTL 缓存；审计 | 677 行 |
+| `src/modern-policy.ts` | 谓词按「对象所属组」判定：`session` / `workspace` 读谓词 + `sessionWrite` / `workspaceWrite` / `workspaceManage` 分离；`conversationWriteTarget()` 把「仅本人可写」提到**管理员直通之前**；`result(..., payload)` 在建会话/fork 时冻结工作区与组绑定；`confinePaths` 对工作区文件读取做路径收敛 | 224 行 |
+| `src/modern-gateway.ts` | `ModernAuth` 增加组查询/绑定/收敛接缝；`policy.result` 传入请求 payload；直连路由拆分：`/api/session.export` 用策略**读**谓词（组内可读），`/api/session/uploadFileBinary` 仍是**仅归属人**（组内可读 ≠ 可写）；query 上的 `sessionId` 重复参数一律拒绝（宿主 `Object.fromEntries` 取最后一个，与 `get()` 分叉） | 54 行 |
+| `src/index.ts` | 归属表 v2（组绑定/私有空间）+ 串行化写入与回滚；空间供给接线；登录/注册时供给；6 个组 RPC + **6 个工作区/空间 RPC**；**2 个会话浏览 RPC**；文件读取收敛接线（`confinePaths`）；标题 TTL 缓存；审计 | 685 行 |
 | `src/client.ts` | 设置面板「组（项目）」分区（管理员 CRUD + 组工作区绑定/创建/解绑、私有空间卡片）+「按用户浏览会话」分区（组标签与组筛选） | 430 行 |
-| `test/spaces.test.mjs` | **新增**：目录清洗/去重/穿越防护、幂等供给、宿主缺席 fail-closed（13 例） | 218 行 |
+| `test/spaces.test.mjs` | **新增**：目录清洗/去重/穿越防护、`confinePath` 收敛、幂等供给、宿主缺席 fail-closed（14 例） | 250 行 |
 | `test/group-store.test.mjs` | **新增**：存储与成员判定（9 例） | 146 行 |
-| `test/group-policy.test.mjs` | **新增**：权限矩阵、建会话落点、投影、绑定冻结、fail-closed（16 例） | 247 行 |
+| `test/group-policy.test.mjs` | **新增**：权限矩阵、建会话落点、投影、绑定冻结、文件读取收敛、fail-closed（17 例） | 290 行 |
 | `test/session-transcript.test.mjs` | **新增**：转录提取、标题折叠、分组、防御性（8 例） | 129 行 |
+
+### 安全加固：工作区文件读取收敛（0.8.0）
+
+宿主 `workspaceFiles/read|readBytes|stat` 的文档写着 "absolute path … files outside it are allowed"，
+只有 `list` 会做包含性校验：**任何登录用户只要有一个可读会话，就能读到 DSH 进程可读的任意文件**
+（`~/.dsh/.credentials.yaml` 里的全部口令哈希、TOTP 密钥与归属表，别人的私有空间与会话日志……
+——这会让「私有空间」名存实亡）。本 fork 因此在策略层补上收敛：
+
+- 普通用户的每次 `workspaceFiles/{read,readBytes,stat,list,changes}` 与 `officeToPdf/*`
+  都必须证明「目标路径落在**该会话自己的工作区**内」（`confinePath()`：绝对/相对路径、
+  `baseFile` 相对解析、`..` 折叠、同前缀兄弟目录、Windows 大小写都按平台规则处理）；
+  判不出来（会话没有工作区记录、宿主注册表缺席、回调抛错）一律拒绝；
+- 管理员不受此限制（部署级能力保持上游不变）；
+- `DSH_AUTH_CONFINE_FILES=0` 可关闭（默认开启）；
+- **残余**：工作区内的**符号链接**指向外部时仍会被读到（宿主 `fs.resolve` 会跟随）。
+  要彻底堵住需要宿主在 `locateFile` 里改用 `fs.contains`（已在上游反馈过的方向）。
+
+### 直连路由的两个坑
+
+- `/api/session.export?sessionId=…`：宿主用 `Object.fromEntries(url.searchParams)` 取值
+  （**重复参数取最后一个**），而网关的 `get()` 取第一个 —— 两边分叉就能「检查 A 的会话、导出 B 的会话」。
+  现在 query 上的 `sessionId` 重复出现即拒绝。
+- `/api/session/uploadFileBinary`：上传是**写**面（把字节挂在指定会话下），因此判定与
+  `fileUploads/upload` 一致 —— 仅归属人本人，管理员对他人会话同样只读。
 
 ### 宿主接缝
 
@@ -129,14 +154,15 @@
    - `modern-policy.ts`：`OwnershipLookup` 增加 `sessionGroup` / `sessionWorkspace` / `workspaceGroup` /
      `isMember` / `bindSession`；谓词块（`const session = ...`）拆读/写/管理；`result()` 增加 `payload` 参数
      并在建会话/fork 时调 `bindSession`；`authorize()` 开头插「写前置校验」；各端点按读/写/管理谓词替换；
-   - `modern-gateway.ts`：`ModernAuth` 增加组查询接缝；`policy.result(...)` 传入 `envelope.payload`；
-     `ownsQuerySession()` 改用 `policy.session()`；
-   - `index.ts`：归属表 v2 + `mutateOwnership()` 串行写入；`SpaceProvisioner` 接线；登录/注册后供给；
+   - `modern-gateway.ts`：`ModernAuth` 增加组查询/收敛接缝；`policy.result(...)` 传入 `envelope.payload`；
+     `ownsQuerySession()` 改用 `policy.session()`；query `sessionId` 重复参数拒绝；
+   - `index.ts`：归属表 v2 + `mutateOwnership()` 串行写入；`SpaceProvisioner` 接线；
+     `confinePaths` 接线（`sessionWorkspaces` → 注册表路径 → `confinePath`）；登录/注册后供给；
      组 RPC 分支；工作区/空间 RPC 分支；`groups.load()` / `groups.flush()` / `storeRemove` 联动；
    - `client.ts`：`GroupsPage` + `SessionsByUserPage` + `settings.section` 注册
      （`id: 'auth-groups'`, `order: 32`；`id: 'auth-sessions'`, `order: 33`）。
-3. `npm test` 必须全绿：上游 145 项安全断言 + `modern-policy` 19 例 + 本包新增 46 例
-   （spaces 13 / group-store 9 / group-policy 16 / session-transcript 8）+ 宿主集成 161 项。
+3. `npm test` 必须全绿：上游 145 项安全断言 + `modern-policy` 19 例 + 本包新增 48 例
+   （spaces 14 / group-store 9 / group-policy 17 / session-transcript 8）+ 宿主集成 170 项。
 
 未接线组功能时（组表为空、归属表里没有任何组绑定）行为与上游一致：一切都是私有的，
 这条由 `test/group-policy.test.mjs` 的「未接线组功能时行为与上游一致」用例固化。

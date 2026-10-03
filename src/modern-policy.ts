@@ -78,6 +78,8 @@ const PLUGIN_MANAGER_READ = new Set(['listPlugins', 'listBundles', 'registries',
 const SESSION_INTERACTIVE = new Set(['userQuestions/answer', 'userQuestions/attachWait'])
 /** Office-to-PDF carries positional args `(workspaceFileScopeId, path, priority)`. */
 const OFFICE_TO_PDF_SCOPE_INDEX = 0
+/** …and the second positional arg is the target path. */
+const OFFICE_TO_PDF_PATH_INDEX = 1
 
 /** The raw `args` value of a Remote payload (an object, or a positional array). */
 function rawArgs(payload: unknown): unknown {
@@ -155,6 +157,19 @@ export interface ModernPolicyOptions {
    * 管理员从不受此限制。未提供该回调时行为与以前完全一致。
    */
   readonly entitlement?: (principal: Principal) => Promise<ModelEntitlement | undefined> | ModelEntitlement | undefined
+  /**
+   * 工作区文件读取的路径收敛（安全加固，0.8.0）：宿主 `workspaceFiles/read|readBytes|stat|list`
+   * **不限制路径**（绝对路径可指向进程可读的任意文件），因此普通用户的每次读取都要在这里
+   * 证明「目标在该会话的工作区内」。
+   *
+   * 未提供该回调时保持上游行为（管理员不受此限制）；回调抛错或返回非 true 一律拒绝。
+   */
+  readonly confinePaths?: (
+    principal: Principal,
+    sessionId: string,
+    path: string,
+    baseFile: string | undefined,
+  ) => Promise<boolean> | boolean
 }
 
 /** provider 行/模型行的字段名在不同包里有 `id`/`provider`/`model` 等写法，这里做容错读取。 */
@@ -290,6 +305,24 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
   }
 
   /**
+   * 工作区文件读取的路径判定：管理员放行；其余人必须有可判定的、落在会话工作区内的路径。
+   *
+   * fail-closed：路径缺失、scope 缺失、回调缺席以外的任何不确定情形都返回 false。
+   */
+  const pathAllowed = async (principal: Principal, scope: unknown, path: unknown, baseFile?: unknown): Promise<boolean> => {
+    if (principal.role === 'admin') return true
+    // 未接线：保持上游行为（路径由部署方自己把关，本模块不额外判定）。
+    if (options.confinePaths === undefined) return true
+    // 接线后（本仓库的默认部署）：必须是「可判定的、会话内的路径」，缺一不可。
+    if (!nonempty(scope) || !nonempty(path)) return false
+    try {
+      return (await options.confinePaths(principal, scope, path, nonempty(baseFile) ? baseFile : undefined)) === true
+    } catch {
+      return false
+    }
+  }
+
+  /**
    * 从建会话请求推出新会话的绑定（工作区 + 组）。
    *
    * - `session/create`：工作区由客户端指定（策略层已按可写性校验过），组绑定取该工作区的绑定；
@@ -335,7 +368,10 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
         if (endpoint === 'session/control') return true
         if (endpoint === 'session/follow') return authorizeSession(args, principal)
         if (endpoint === 'workspace/follow') return true
-        if (endpoint === 'workspaceFiles/changes') return session(principal, args.workspaceFileScopeId)
+        if (endpoint === 'workspaceFiles/changes') {
+          return session(principal, args.workspaceFileScopeId)
+            && await pathAllowed(principal, args.workspaceFileScopeId, args.path)
+        }
         return false
       }
       if (endpoint === '$events/result') {
@@ -366,7 +402,9 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
         const scope = Array.isArray(raw) ? raw[OFFICE_TO_PDF_SCOPE_INDEX] : args.workspaceFileScopeId
         if (!session(principal, scope)) return false
         const workspaceId = Array.isArray(raw) ? undefined : args.workspaceId
-        return workspaceId === undefined || workspace(principal, workspaceId)
+        if (workspaceId !== undefined && !workspace(principal, workspaceId)) return false
+        const path = Array.isArray(raw) ? raw[OFFICE_TO_PDF_PATH_INDEX] : args.path
+        return await pathAllowed(principal, scope, path)
       }
       // open-in-app 的应用清单按会话归属（等价于按用户）。
       if (endpoint === 'session/workspacePathApplications') {
@@ -428,7 +466,10 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
         // Workspace creation stays deployment-owned: a path is a host capability, not a user one.
         return false
       }
-      if (namespace === 'workspaceFiles') return session(principal, args.workspaceFileScopeId)
+      if (namespace === 'workspaceFiles') {
+        return session(principal, args.workspaceFileScopeId)
+          && await pathAllowed(principal, args.workspaceFileScopeId, args.path, args.baseFile)
+      }
       if (endpoint === 'skills/list') return session(principal, request.sessionId)
       if (endpoint === 'fileReferences/list') return agent(principal, args)
       if (endpoint === 'sessionReferenceResolver/candidates') return agent(principal, args)

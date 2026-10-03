@@ -10,6 +10,7 @@ import { isAbsolute, relative, resolve, sep } from 'node:path'
 import {
   SEGMENT_MAX,
   SpaceProvisioner,
+  confinePath,
   listSpaceWorkspaces,
   readSpaceConfig,
   safeSegment,
@@ -97,6 +98,30 @@ test('目录片段去重：不同用户名的清洗结果不会撞到同一目�
   // 每个都带 8 位去重后缀，且与「真的叫 user 的人」不冲突
   for (const segment of segments) assert.match(segment, /-[0-9a-f]{8}$/, segment)
   assert.ok(!segments.includes('user'), segments.join(','))
+})
+
+test('路径收敛 confinePath：工作区内放行，越界/同前缀/相对逃逸一律拒绝', () => {
+  const root = '/srv/spaces/groups/wg1'
+  // 工作区内（绝对与相对都支持）
+  assert.equal(confinePath(root, '/srv/spaces/groups/wg1/a.md'), '/srv/spaces/groups/wg1/a.md')
+  assert.equal(confinePath(root, 'a.md'), '/srv/spaces/groups/wg1/a.md')
+  assert.equal(confinePath(root, 'docs/../a.md'), '/srv/spaces/groups/wg1/a.md')
+  assert.equal(confinePath(root, '/srv/spaces/groups/wg1'), '/srv/spaces/groups/wg1')
+  // 相对路径以 baseFile 所在目录为基准
+  assert.equal(confinePath(root, 'b.md', '/srv/spaces/groups/wg1/docs/a.md'), '/srv/spaces/groups/wg1/docs/b.md')
+  assert.equal(confinePath(root, '../secret.md', '/srv/spaces/groups/wg1/docs/a.md'), '/srv/spaces/groups/wg1/secret.md')
+  assert.equal(confinePath(root, '../../secret.md', '/srv/spaces/groups/wg1/docs/a.md'), undefined)
+  // 越界：凭据文件、别人的私有空间、同前缀的兄弟目录、相对逃逸
+  assert.equal(confinePath(root, '/Users/x/.dsh/.credentials.yaml'), undefined)
+  assert.equal(confinePath(root, '/srv/spaces/users/alice/secret.md'), undefined)
+  assert.equal(confinePath(root, '/srv/spaces/groups/wg1-evil/x.md'), undefined)
+  assert.equal(confinePath(root, '../../users/alice/secret.md'), undefined)
+  assert.equal(confinePath(root, '/srv/spaces/groups'), undefined)
+  // 形状非法 → undefined（fail-closed）
+  assert.equal(confinePath(root, ''), undefined)
+  assert.equal(confinePath(root, undefined), undefined)
+  assert.equal(confinePath('', '/srv/spaces/groups/wg1/a.md'), undefined)
+  assert.equal(confinePath(undefined, 'a.md'), undefined)
 })
 
 test('私有空间：建目录 → 注册 → 认领归属 → 记住映射', async () => {

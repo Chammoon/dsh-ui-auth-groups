@@ -244,7 +244,7 @@ server.on('request', (req, res) => {
   const rawPath = String(req.url).split('?')[0]
   if (req.method !== 'POST' || !rawPath.startsWith('/api/')) return
   const method = rawPath.slice('/api/'.length)
-  if (method !== 'session/create' && method !== 'session/list') return
+  if (method !== 'session/create' && method !== 'session/list' && method !== 'workspaceFiles/read') return
   ;(async () => {
     let body = ''
     const dec = new TextDecoder()
@@ -252,7 +252,9 @@ server.on('request', (req, res) => {
     let rpcId = 'x'
     try { rpcId = JSON.parse(body).rpcId || 'x' } catch (e) { /* keep default */ }
     let value
-    if (method === 'session/create') {
+    if (method === 'workspaceFiles/read') {
+      value = { text: 'file-body', path: 'ok' }
+    } else if (method === 'session/create') {
       const id = 'gw-session-' + (gatewaySessions.length + 1)
       gatewaySessions.push(id)
       value = { sessionId: id }
@@ -475,10 +477,12 @@ let adminWorkspaceId
   check('adminListWorkspaces 列出管理员私有空间', adminRow !== undefined && adminRow.privateOf === 'admin', res.body)
 }
 let groupWorkspaceId
+let groupWorkspacePath
 {
   const res = await post('/auth/rpc/ensureGroupWorkspace', adminCookie, JSON.stringify({ id: groupId }))
   const j = parseJson(res)
   groupWorkspaceId = j.workspace !== undefined ? j.workspace.workspaceId : undefined
+  groupWorkspacePath = j.workspace !== undefined ? j.workspace.path : undefined
   check('ensureGroupWorkspace 建出组工作区并绑定', j.ok === true && typeof groupWorkspaceId === 'string'
     && j.group.workspace.workspaceId === groupWorkspaceId, res.body)
   check('组工作区目录在 <root>/groups 下', typeof j.workspace.path === 'string'
@@ -605,6 +609,33 @@ let privateSessionId
   check('上传：归属人自己的会话放行到宿主', ownerUpload.status === 200, 'status=' + ownerUpload.status)
   const adminUpload = await uploadTo(adminCookie, groupSessionId)
   check('上传：管理员对他人会话同样只读 403', adminUpload.status === 403, 'status=' + adminUpload.status)
+}
+// 工作区文件读取的路径收敛：宿主接受任意绝对路径，插件必须只放行会话工作区内的路径
+{
+  const readFile = async (cookie, sessionId, path) => callApi('workspaceFiles/read', cookie, { args: { workspaceFileScopeId: sessionId, path: path, range: {} } })
+  const bobPrivate = spacesRoot + '/users/bob'
+  const own = await readFile(bobCookie, privateSessionId, bobPrivate + '/notes.md')
+  check('文件读取：会话工作区内的文件放行', own.status === 200, 'status=' + own.status)
+  const sibling = await readFile(bobCookie, privateSessionId, spacesRoot + '/users/admin/secret.md')
+  check('文件读取：别人的私有空间 403', sibling.status === 403, 'status=' + sibling.status)
+  const escape = await readFile(bobCookie, privateSessionId, '/etc/hosts')
+  check('文件读取：绝对路径越界 403（凭据/系统文件）', escape.status === 403, 'status=' + escape.status)
+  const traversal = await readFile(bobCookie, privateSessionId, bobPrivate + '/../admin/secret.md')
+  check('文件读取：相对逃逸 403', traversal.status === 403, 'status=' + traversal.status)
+  const groupMate = await readFile(carolCookie, groupSessionId, groupWorkspacePath + '/docs/a.md')
+  check('文件读取：组员读组工作区内的文件放行', groupMate.status === 200, 'status=' + groupMate.status)
+  const groupEscape = await readFile(carolCookie, groupSessionId, '/Users/x/.dsh/.credentials.yaml')
+  check('文件读取：组员也读不到工作区外（凭据文件）403', groupEscape.status === 403, 'status=' + groupEscape.status)
+  const outsider = await readFile(daveCookie, groupSessionId, groupWorkspacePath + '/docs/a.md')
+  check('文件读取：组外用户连会话都不可读 403', outsider.status === 403, 'status=' + outsider.status)
+  const admin = await readFile(adminCookie, privateSessionId, '/etc/hosts')
+  check('文件读取：管理员不受路径收敛限制（部署级能力）', admin.status === 200, 'status=' + admin.status)
+}
+// 直连路由的重复 sessionId：宿主取最后一个、网关取第一个 → 必须一律拒绝
+{
+  const dup = await get('/api/session.export?sessionId=' + encodeURIComponent(privateSessionId)
+    + '&sessionId=' + encodeURIComponent(groupSessionId), bobCookie)
+  check('导出：重复 sessionId 参数 403（网关/宿主取值不一致）', dup.status === 403, 'status=' + dup.status)
 }
 // 管理员「按用户浏览会话」要能看出会话属于哪个组/工作区
 {

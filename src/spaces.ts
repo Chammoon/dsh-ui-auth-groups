@@ -16,7 +16,7 @@
  */
 
 import { homedir } from 'node:os'
-import { resolve, sep } from 'node:path'
+import { dirname, isAbsolute, normalize, posix, resolve, sep, win32 } from 'node:path'
 
 /** 目录名长度上限（截断后仍与 id 后缀拼成合法文件名）。 */
 export const SEGMENT_MAX = 48
@@ -119,6 +119,32 @@ function shortHash(text: string): string {
     hash = Math.imul(hash, 0x01000193) >>> 0
   }
   return hash.toString(16).padStart(8, '0')
+}
+
+/**
+ * 路径收敛：`path`（绝对，或相对 `baseFile` 所在目录 / 工作区根）是否落在 `root` 之内。
+ *
+ * 宿主 `workspaceFiles/read|readBytes|stat` **不限制**路径（其文档明说 "files outside it
+ * are allowed"），因此普通用户只要能读任一会话，就能读到进程可读的任意文件
+ * （`~/.dsh/.credentials.yaml`、别人的私有空间、会话日志……）。这里在策略层补上包含性判定。
+ * @returns 规范化后的绝对路径；越界、拼写非法或无法判定时返回 `undefined`（fail-closed）。
+ */
+export function confinePath(root: unknown, path: unknown, baseFile?: unknown): string | undefined {
+  const rootText = typeof root === 'string' ? root.trim() : ''
+  const pathText = typeof path === 'string' ? path.trim() : ''
+  if (rootText === '' || pathText === '') return undefined
+  const api = /^[A-Za-z]:[\\/]/.test(rootText) || rootText.startsWith('\\\\') ? win32 : posix
+  const absoluteRoot = api.resolve(rootText)
+  // 相对路径以 baseFile 所在目录为基准；没有 baseFile 时以工作区根为基准。
+  const baseText = typeof baseFile === 'string' ? baseFile.trim() : ''
+  const baseDir = baseText !== '' && api.isAbsolute(baseText) ? api.dirname(api.normalize(baseText)) : absoluteRoot
+  const candidate = api.isAbsolute(pathText) ? api.resolve(pathText) : api.resolve(baseDir, pathText)
+  // Windows 路径大小写不敏感：比较前统一折叠，避免同目录被误判为越界（或反之）。
+  const fold = (value: string): string => (api === win32 ? value.toLowerCase() : value)
+  const target = fold(normalize(candidate))
+  const baseFold = fold(absoluteRoot)
+  if (target === baseFold) return target
+  return target.startsWith(baseFold + api.sep) ? target : undefined
 }
 
 /** 从宿主工作区实体里取出 {id,path,title}；形状不认识时返回 undefined。 */
