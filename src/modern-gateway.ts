@@ -280,6 +280,37 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
   }
 
   /**
+   * `session/create` 自带一个**别人的**会话 id 时，宿主本会回 `session/writer-held`，
+   * DSH 客户端据此自动改用新会话重试（`reuseBlank` 的降级路径，见 ui-workspace/navigation）。
+   *
+   * 策略层先拦下请求之后，必须用同一个错误码回应，否则成员在组工作区里点开别人留下的
+   * 空白会话时界面会直接报错，而不是替他开一个新会话。
+   *
+   * 只对「调用者本来就能读」的会话这么做：不可见的会话保持纯 403，避免把它变成存在性预言机。
+   */
+  async function writerHeldRefusal(who: Principal, endpoint: string, payload: unknown): Promise<JsonObject | undefined> {
+    if (endpoint !== 'session/create') return undefined
+    const args = remoteArgs(payload)
+    const request = args !== undefined && object(args.request) ? args.request : args
+    const sessionId = object(request) ? request.sessionId : undefined
+    if (!nonempty(sessionId) || auth.session(sessionId) === who.username) return undefined
+    if (!policy.session(who, sessionId)) return undefined
+    const exists = await auth.sessionExists(sessionId).catch(() => true)
+    if (!exists) return undefined
+    return {
+      type: 'server-response',
+      result: {
+        ok: false,
+        error: {
+          code: 'session/writer-held',
+          message: `session "${sessionId}" belongs to another user`,
+          details: { sessionId },
+        },
+      },
+    }
+  }
+
+  /**
    * The single `sessionId` of a query-addressed route.
    *
    * 宿主用 `Object.fromEntries(url.searchParams)` 取值 —— **重复参数取最后一个**，
@@ -400,6 +431,8 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
     for (const rules of policies.values()) {
       const remote = rules.remote
       if (remote?.matches(endpoint) === true && !(await remote.authorize(who, envelope.payload))) {
+        const refusal = await writerHeldRefusal(who, endpoint, envelope.payload)
+        if (refusal !== undefined) { json(res, 200, { ...refusal, rpcId: envelope.rpcId }); return true }
         json(res, 403, { error: 'Access denied' }); return true
       }
     }
@@ -413,7 +446,11 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
       const rule = extension('rpc', endpoint)
       allowed = rule ? await rule.authorize(who, envelope.payload) : await policy.authorize(who, endpoint, envelope.payload)
     }
-    if (!allowed) { json(res, 403, { error: 'Access denied' }); return true }
+    if (!allowed) {
+      const refusal = await writerHeldRefusal(who, endpoint, envelope.payload)
+      if (refusal !== undefined) { json(res, 200, { ...refusal, rpcId: envelope.rpcId }); return true }
+      json(res, 403, { error: 'Access denied' }); return true
+    }
     // The response is parsed and re-serialized for ownership projection, so the upstream
     // half must hand back identity bytes: a compressed body cannot be projected.
     req.headers['accept-encoding'] = 'identity'

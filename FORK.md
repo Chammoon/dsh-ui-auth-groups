@@ -83,8 +83,8 @@
 | `src/group-store.ts` | **新增**：组存储（原子落盘、防抖、损坏隔离、`isMember()` 同步索引） | 300 行 |
 | `src/session-transcript.ts` | **新增**：会话事件流 → 只读转录（纯函数：正文提取、标题折叠、按归属分组 + 组/工作区标注） | 226 行 |
 | `src/modern-policy.ts` | 谓词按「对象所属组」判定：`session` / `workspace` 读谓词 + `sessionWrite` / `workspaceWrite` / `workspaceManage` 分离；`conversationWriteTarget()` 把「仅本人可写」提到**管理员直通之前**；`result(..., payload)` 在建会话/fork 时冻结工作区与组绑定；`confinePaths` 对工作区文件读取做路径收敛 | 224 行 |
-| `src/modern-gateway.ts` | `ModernAuth` 增加组查询/绑定/收敛接缝；`policy.result` 传入请求 payload；直连路由拆分：`/api/session.export` 用策略**读**谓词（组内可读），`/api/session/uploadFileBinary` 仍是**仅归属人**（组内可读 ≠ 可写）；query 上的 `sessionId` 重复参数一律拒绝（宿主 `Object.fromEntries` 取最后一个，与 `get()` 分叉） | 54 行 |
-| `src/index.ts` | 归属表 v2（组绑定/私有空间）+ 串行化写入与回滚；空间供给接线；登录/注册时供给；6 个组 RPC + **6 个工作区/空间 RPC**；**2 个会话浏览 RPC**；文件读取收敛接线（`confinePaths`）；标题 TTL 缓存；审计 | 685 行 |
+| `src/modern-gateway.ts` | `ModernAuth` 增加组查询/绑定/收敛接缝；`policy.result` 传入请求 payload；直连路由拆分：`/api/session.export` 用策略**读**谓词（组内可读），`/api/session/uploadFileBinary` 仍是**仅归属人**（组内可读 ≠ 可写）；query 上的 `sessionId` 重复参数一律拒绝（宿主 `Object.fromEntries` 取最后一个，与 `get()` 分叉）；`session/create` 带他人 id 时合成宿主同款 `session/writer-held` | 84 行 |
+| `src/index.ts` | 归属表 v2（组绑定/私有空间）+ 串行化写入与回滚；空间供给接线；登录/注册时供给；6 个组 RPC + **6 个工作区/空间 RPC**；**2 个会话浏览 RPC**；文件读取收敛接线（`confinePaths`）；`sessionExists` 同时支持 0.2.0 的 `stat` 与旧 `inspect`；标题 TTL 缓存；审计 | 697 行 |
 | `src/client.ts` | 设置面板「组（项目）」分区（管理员 CRUD + 组工作区绑定/创建/解绑、私有空间卡片）+「按用户浏览会话」分区（组标签与组筛选） | 430 行 |
 | `test/spaces.test.mjs` | **新增**：目录清洗/去重/穿越防护、`confinePath` 收敛、幂等供给、宿主缺席 fail-closed（14 例） | 250 行 |
 | `test/group-store.test.mjs` | **新增**：存储与成员判定（9 例） | 146 行 |
@@ -106,6 +106,21 @@
 - `DSH_AUTH_CONFINE_FILES=0` 可关闭（默认开启）；
 - **残余**：工作区内的**符号链接**指向外部时仍会被读到（宿主 `fs.resolve` 会跟随）。
   要彻底堵住需要宿主在 `locateFile` 里改用 `fs.contains`（已在上游反馈过的方向）。
+
+### 建会话：客户端自带 id（reuseBlank）
+
+DSH 客户端点开一个工作区时会先找该工作区里的**空白会话**复用，命中就带 id 调
+`session/create {workspaceId, sessionId}`（`ui-workspace/navigation.ts` 的 `reuseBlank`），
+只有宿主回 `session/writer-held` 时才降级成「不带 id 新建」。这条路径有两个坑：
+
+- **`sessionExists` 必须认 0.2.0 的 `sessionPersistence.stat`**：0.2.0 的持久化服务是
+  `stat(id)`（不存在时返回 `undefined`），没有 `inspect`。原来只认 `inspect`，取不到就
+  fail-closed 返回「存在」→ **任何自带 id 的建会话都被判成已存在而 403**，
+  表现就是「成员在组工作区里点开会话直接被拒绝」。现在两种宿主 API 都支持。
+- **别人的会话要回宿主同款错误码**：策略层先于宿主拦下请求，因此必须自己回一个
+  `session/writer-held` 失败信封（HTTP 200 + `result.ok=false`），客户端才会自动改用新会话重试；
+  否则界面直接报错。只对「调用者本来就能读」的会话这么做（不可见的会话保持纯 403，不做存在性预言机），
+  并且**绝不把请求转发给宿主** —— 冷会话会被宿主 resume 并把写权限交出去。
 
 ### 直连路由的两个坑
 
@@ -162,7 +177,7 @@
    - `client.ts`：`GroupsPage` + `SessionsByUserPage` + `settings.section` 注册
      （`id: 'auth-groups'`, `order: 32`；`id: 'auth-sessions'`, `order: 33`）。
 3. `npm test` 必须全绿：上游 145 项安全断言 + `modern-policy` 19 例 + 本包新增 48 例
-   （spaces 14 / group-store 9 / group-policy 17 / session-transcript 8）+ 宿主集成 170 项。
+   （spaces 14 / group-store 9 / group-policy 17 / session-transcript 8）+ 宿主集成 175 项。
 
 未接线组功能时（组表为空、归属表里没有任何组绑定）行为与上游一致：一切都是私有的，
 这条由 `test/group-policy.test.mjs` 的「未接线组功能时行为与上游一致」用例固化。

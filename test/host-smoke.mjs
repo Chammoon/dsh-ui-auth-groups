@@ -125,6 +125,17 @@ const sessionQueryMock = {
     }
   },
 }
+// ---- mock 会话持久化（ctx.sessionPersistence）：0.2.0 是 stat(id)，不存在返回 undefined ----
+// 客户端自带 id 建会话（reuseBlank）时，插件必须先能证明「这个 id 不存在」才会放行。
+const coldSessions = new Set(['cold-session-1'])
+const sessionPersistenceMock = {
+  async stat(id) {
+    if (gatewaySessions.indexOf(id) !== -1 || Object.prototype.hasOwnProperty.call(fakeSessions, id)
+      || coldSessions.has(id)) return { id: id, revision: 'r1' }
+    return undefined
+  },
+}
+
 // ---- mock 宿主工作区注册表（ctx.workspaceRegistry）：按 canonical path 去重 ----
 const workspaceRegistryMock = (() => {
   const byPath = new Map()
@@ -156,6 +167,7 @@ const ctx = {
     if (name2 === 'connection') return modernConnection
     if (name2 === 'sessionQuery') return sessionQueryMock
     if (name2 === 'workspaceRegistry') return workspaceRegistryMock
+    if (name2 === 'sessionPersistence') return sessionPersistenceMock
     return undefined
   },
   effect(cb) { disposers.push(cb) },
@@ -251,12 +263,18 @@ server.on('request', (req, res) => {
     for await (const chunk of req) body += dec.decode(chunk, { stream: true })
     let rpcId = 'x'
     try { rpcId = JSON.parse(body).rpcId || 'x' } catch (e) { /* keep default */ }
+    const parsed = JSON.parse(body)
+    const requestedSessionId = parsed.payload !== undefined && parsed.payload.args !== undefined
+      && parsed.payload.args.request !== undefined ? parsed.payload.args.request.sessionId : undefined
     let value
     if (method === 'workspaceFiles/read') {
       value = { text: 'file-body', path: 'ok' }
     } else if (method === 'session/create') {
-      const id = 'gw-session-' + (gatewaySessions.length + 1)
-      gatewaySessions.push(id)
+      // 宿主契约：自带的 id 优先（create or idempotently adopt）
+      const id = typeof requestedSessionId === 'string' && requestedSessionId !== ''
+        ? requestedSessionId
+        : 'gw-session-' + (gatewaySessions.length + 1)
+      if (gatewaySessions.indexOf(id) === -1) gatewaySessions.push(id)
       value = { sessionId: id }
     } else {
       value = { items: gatewaySessions.map((id) => ({ sessionId: id, updatedAt: 1, running: false, blank: false })) }
@@ -636,6 +654,40 @@ let privateSessionId
   const dup = await get('/api/session.export?sessionId=' + encodeURIComponent(privateSessionId)
     + '&sessionId=' + encodeURIComponent(groupSessionId), bobCookie)
   check('导出：重复 sessionId 参数 403（网关/宿主取值不一致）', dup.status === 403, 'status=' + dup.status)
+}
+// 客户端自带 id 建会话（DSH 的 reuseBlank 路径）：
+//   ① 全新 id 必须放行（0.2.0 的持久化服务是 stat，不是 inspect）；
+//   ② 别人的会话必须回宿主同款 session/writer-held，客户端才会自动改用新会话重试；
+//   ③ 自己不可见的会话保持纯 403（不暴露存在性）；④ 冷会话（只存在于持久化里）同样拒绝。
+let clientMintedSessionId
+{
+  clientMintedSessionId = 'client-minted-' + Date.now()
+  const res = await callApi('session/create', bobCookie, { args: { request: { workspaceId: bobWorkspaceId, sessionId: clientMintedSessionId } } })
+  const j = parseJson(res)
+  check('自带新 id 建会话：放行并回显该 id',
+    res.status === 200 && j.result !== undefined && j.result.ok === true
+    && j.result.value.sessionId === clientMintedSessionId, res.body)
+  const ownership = JSON.parse(records.get('dsh-auth/ownership').payload)
+  check('自带新 id 建会话：归属人仍是调用者本人',
+    ownership.sessions[clientMintedSessionId] === 'bob', JSON.stringify(ownership.sessions[clientMintedSessionId]))
+}
+{
+  // carol 能读 bob 的组会话，但不能把它当成自己的会话创建 → 宿主同款错误码，客户端会自动建新的
+  const res = await callApi('session/create', carolCookie, { args: { request: { workspaceId: groupWorkspaceId, sessionId: groupSessionId } } })
+  const j = parseJson(res)
+  check('自带他人会话 id：回 session/writer-held（客户端可自动降级）',
+    res.status === 200 && j.result !== undefined && j.result.ok === false
+    && j.result.error.code === 'session/writer-held', res.body)
+}
+{
+  // dave 读不到该会话 → 纯 403，不泄露存在性
+  const res = await callApi('session/create', daveCookie, { args: { request: { workspaceId: bobWorkspaceId, sessionId: groupSessionId } } })
+  check('自带不可见会话 id：403（不暴露存在性）', res.status === 403, res.body)
+}
+{
+  // 冷会话：只存在于持久化里（归属表没有）→ 仍然拒绝
+  const res = await callApi('session/create', bobCookie, { args: { request: { workspaceId: bobWorkspaceId, sessionId: 'cold-session-1' } } })
+  check('自带冷会话 id（仅存在于持久化）：拒绝', res.status === 403, res.body)
 }
 // 管理员「按用户浏览会话」要能看出会话属于哪个组/工作区
 {
