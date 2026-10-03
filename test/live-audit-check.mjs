@@ -7,7 +7,7 @@
 import http from 'node:http'
 import fs from 'node:fs'
 
-const AUDIT_FILE = process.argv[2] || 'D:\\deepseekHarness\\recovery\\deepseek-harness\\dsh-ui-auth-audit.jsonl'
+const AUDIT_FILE = process.argv[2] || 'D:\\deepseekHarness\\recovery\\deepseek-harness\\dsh-ui-auth-groups-audit.jsonl'
 const post = (p, body, cookie) => new Promise((done) => {
   const d = JSON.stringify(body)
   const r = http.request({

@@ -159,7 +159,7 @@ for (const name of ['files', 'network', 'commands', 'credentials', 'protectedDsh
 }
 
 // ---- render ----
-console.log(`dsh-ui-auth store contract check — package.json@${manifest.version}\n`)
+console.log(`dsh-ui-auth-groups store contract check — package.json@${manifest.version}\n`)
 for (const r of rows) {
   if (r.ok === null) { console.log(`  ℹ  ${r.gate}: ${r.detail}`); continue }
   if (r.ok) { console.log(`  ✓  ${r.gate}`); continue }

@@ -84,6 +84,38 @@ function requestOf(args: JsonObject): JsonObject {
   return args
 }
 
+/**
+ * 会话「写」端点的目标会话 id。
+ *
+ * 作用是把「仅本人可写」提前到**管理员直通之前**：管理员可以读他人会话，
+ * 但写动作（prompt / cancel / rename / fork / updateQueue / attachment /
+ * selectModel / 作答 / 反馈 / 目标 / 上传）同样只属于会话归属人。
+ *
+ * 只登记会改变会话内容或状态的动作；读面与部署级管理面（设置、凭据、插件、
+ * 工作区增删改）不在其中，管理员的部署级能力保持上游不变。
+ *
+ * 解析不出目标 id 时返回 `undefined`，交常规规则判定 —— 缺少 id 的调用在宿主侧
+ * 也无法定位会话，不构成绕过。
+ */
+function conversationWriteTarget(endpoint: string, args: JsonObject): string | undefined {
+  const request = requestOf(args)
+  const fromRequest = (): string | undefined => {
+    const value = request.sessionId ?? args.sessionId
+    return nonempty(value) ? value : undefined
+  }
+  const fromAgent = (): string | undefined => (nonempty(args.agentId) ? args.agentId : undefined)
+  if (endpoint.startsWith('session/')) {
+    return SESSION_BY_ID.has(endpoint.slice('session/'.length)) ? fromRequest() : undefined
+  }
+  if (endpoint === 'userQuestions/answer') return fromAgent() ?? fromRequest()
+  if (endpoint === 'sessionFeedback/record') return fromRequest()
+  if (endpoint.startsWith('messageFeedback/')) return fromRequest()
+  if (endpoint === 'agentPresets/select') return fromAgent()
+  if (endpoint === 'fileUploads/upload') return fromAgent()
+  if (endpoint.startsWith('goals/')) return fromAgent()
+  return undefined
+}
+
 export interface ModernPolicy {
   session(principal: Principal, id: unknown): boolean
   workspace(principal: Principal, id: unknown): boolean
@@ -106,6 +138,17 @@ export interface ModernPolicyOptions {
    * 管理员从不受此限制。未提供该回调时行为与以前完全一致。
    */
   readonly entitlement?: (principal: Principal) => Promise<ModelEntitlement | undefined> | ModelEntitlement | undefined
+  /**
+   * 组可见性回调：`viewer` 与 `owner` 是否同属至少一个组（且非同一人）。
+   *
+   * 语义（组会话权限模型）：
+   * - 读：本人 + 同组 + 管理员；
+   * - 写：仅归属人本人（管理员对他人会话同样只读）。
+   *
+   * 未提供该回调时（或回调抛错时）一律视为「无组关系」，行为与上游完全一致 ——
+   * fail-closed，组存储故障绝不退化成「全员可读」。
+   */
+  readonly sharesGroup?: (viewer: string, owner: string) => boolean
 }
 
 /** provider 行/模型行的字段名在不同包里有 `id`/`provider`/`model` 等写法，这里做容错读取。 */
@@ -138,9 +181,42 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
     nonempty(provider) && nonempty(model)
     && scope.models.some(entry => entry.provider === provider && entry.model === model)
   const arrayOf = (value: unknown): unknown[] => (Array.isArray(value) ? value : [])
+  /**
+   * 组可见性判定：viewer 与 owner 是否同组（且非同一人）。
+   * fail-closed —— 未接线、用户名非法或查询抛错一律视为不同组。
+   */
+  const shares = (viewer: string, owner: string): boolean => {
+    if (!nonempty(viewer) || !nonempty(owner) || viewer === owner) return false
+    try {
+      return options.sharesGroup?.(viewer, owner) === true
+    } catch {
+      return false
+    }
+  }
+  /**
+   * 会话「读」谓词：本人 + 同组 + 管理员。
+   *
+   * 全部列表/工作区/事件帧投影都调用它，因此组内共享会话会自动出现在
+   * 会话列表、工作区视图与实时事件流里，无需逐处改造。
+   */
   const session = (principal: Principal, id: unknown): boolean =>
-    nonempty(id) && (principal.role === 'admin' || owners.session(id) === principal.username)
+    nonempty(id) && (principal.role === 'admin' || owners.session(id) === principal.username
+      || shares(principal.username, owners.session(id)))
+  /**
+   * 会话「写」谓词：仅归属人本人。
+   *
+   * 管理员对他人会话同样只读 —— 这正是需求里的「仅本人可写，组内其他人可读，
+   * 管理员可读」。用于 prompt / cancel / rename / fork / updateQueue /
+   * attachment / selectModel 等一切会改变会话的动作。
+   */
+  const sessionWrite = (principal: Principal, id: unknown): boolean =>
+    nonempty(id) && owners.session(id) === principal.username
+  /** 工作区「读」谓词：本人 + 同组 + 管理员（组会话因此能在侧栏被发现）。 */
   const workspace = (principal: Principal, id: unknown): boolean =>
+    nonempty(id) && (principal.role === 'admin' || owners.workspace(id) === principal.username
+      || shares(principal.username, owners.workspace(id)))
+  /** 工作区「写」谓词：沿用上游语义（本人 + 管理员），组员不得改写他人项目目录。 */
+  const workspaceWrite = (principal: Principal, id: unknown): boolean =>
     nonempty(id) && (principal.role === 'admin' || owners.workspace(id) === principal.username)
   const ownMap = (principal: Principal, value: unknown): JsonObject =>
     Object.fromEntries(Object.entries(object(value) ? value : {}).filter(([id]) => session(principal, id)))
@@ -156,8 +232,10 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
       archivedSessionIds: arrayOf(baseline.archivedSessionIds).filter(id => session(principal, id)),
     }
   }
-  /** An agent-scoped verb is authorized by the Session that owns the agent. */
+  /** Agent-scoped 只读面（文件引用/命令清单/预设读取）按会话读谓词授权。 */
   const agent = (principal: Principal, args: JsonObject): boolean => session(principal, args.agentId)
+  /** Agent-scoped 写动作（上传/目标/作答/选预设）按会话写谓词授权。 */
+  const agentWrite = (principal: Principal, args: JsonObject): boolean => sessionWrite(principal, args.agentId)
 
   function authorizeSession(args: JsonObject, principal: Principal): boolean {
     const request = requestOf(args)
@@ -182,6 +260,11 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
       const raw = rawArgs(payload)
       const args = remoteArgs(payload) ?? (Array.isArray(raw) ? {} : undefined)
       if (args === undefined) return false
+      // 「仅本人可写」必须先于管理员直通：管理员可读他人会话，但不得写入。
+      if (!stream) {
+        const writeTarget = conversationWriteTarget(endpoint, args)
+        if (writeTarget !== undefined && !sessionWrite(principal, writeTarget)) return false
+      }
       if (principal.role === 'admin') return true
       const request = requestOf(args)
       const [namespace, method, extra] = endpoint.split('/')
@@ -207,8 +290,12 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
       }
       // 权限预设目录是只读元数据（写入走 settings/mutate，仍限管理员）。
       if (endpoint === 'permissionPresets/catalog') return true
-      // 交互式提问（作答 / 等待）本质属于某个会话：agentId 或 sessionId 任一属于请求者即放行。
+      // 交互式提问：**作答**是写动作（agentId 或 sessionId 任一归属本人），
+      // **等待**只是挂起观察（组内可读会话也允许，否则只读查看会卡在题目上）。
       if (SESSION_INTERACTIVE.has(endpoint)) {
+        if (endpoint === 'userQuestions/answer') {
+          return agentWrite(principal, args) || sessionWrite(principal, request.sessionId ?? args.sessionId)
+        }
         return agent(principal, args) || session(principal, request.sessionId ?? args.sessionId)
       }
       // 文档预览（Q8：用户 + 会话 + 工作区三重归属）。宿主以 workspaceFileScope（SessionId）
@@ -232,7 +319,9 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
       // 预设选择器同样依赖它。read/select 是 agent 作用域（wire 名 agentId），按会话属主校验。
       // 只有 copy/deletePreset 会写出新的预设组合（可挂载插件与提示词），仍限管理员。
       if (endpoint === 'agentPresets/list') return true
-      if (endpoint === 'agentPresets/read' || endpoint === 'agentPresets/select') return agent(principal, args)
+      // read 是只读面（组内可读会话也要能用），select 会改写会话的预设 → 写谓词。
+      if (endpoint === 'agentPresets/read') return agent(principal, args)
+      if (endpoint === 'agentPresets/select') return agentWrite(principal, args)
       // 插件清单：普通用户可以查看本部署已安装的插件（只读），但安装/卸载/插件设置仍限管理员。
       // 白名单按端点登记，因此宿主后续新增的 pluginInventory/* 写操作默认仍是被拒的。
       if (endpoint === 'pluginInventory/list') return true
@@ -241,10 +330,11 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
         if (method === 'page' || method === 'follow') return authorizeSession(args, principal)
         if (method === 'create') {
           // A deployment-provisioned Workspace owns the location; a client cannot override it with cwd.
-          if (!workspace(principal, request.workspaceId) || request.cwd !== undefined) return false
+          // 建会话只在**自己的**工作区（组共享是「读」而非「共写他人项目目录」）。
+          if (!workspaceWrite(principal, request.workspaceId) || request.cwd !== undefined) return false
           if (request.sessionId === undefined) return true
           if (!nonempty(request.sessionId)) return false
-          return session(principal, request.sessionId) || !(await owners.sessionExists(request.sessionId))
+          return sessionWrite(principal, request.sessionId) || !(await owners.sessionExists(request.sessionId))
         }
         if (SESSION_BY_ID.has(method as string)) {
           if (method === 'selectModel') {
@@ -256,16 +346,18 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
               if (!allowedProvider(scope, provider) || !allowedModel(scope, provider, model)) return false
             }
           }
-          return session(principal, request.sessionId)
+          // prompt/attachment/cancel/rename/fork/updateQueue/selectModel 全部是写动作：仅归属人本人。
+          return sessionWrite(principal, request.sessionId)
         }
         return false
       }
       if (namespace === 'workspace') {
-        if (method === 'archiveSession') return session(principal, request.sessionId)
+        // 归档他人的会话属于写动作。
+        if (method === 'archiveSession') return sessionWrite(principal, request.sessionId)
         if (WORKSPACE_BY_ID.has(method as string)) {
-          if (!workspace(principal, request.workspaceId)) return false
-          if (request.beforeWorkspaceId !== undefined && !workspace(principal, request.beforeWorkspaceId)) return false
-          return [request.sessionId, request.beforeSessionId].every(id => id === undefined || session(principal, id))
+          if (!workspaceWrite(principal, request.workspaceId)) return false
+          if (request.beforeWorkspaceId !== undefined && !workspaceWrite(principal, request.beforeWorkspaceId)) return false
+          return [request.sessionId, request.beforeSessionId].every(id => id === undefined || sessionWrite(principal, id))
         }
         // Workspace creation stays deployment-owned: a path is a host capability, not a user one.
         return false
@@ -274,11 +366,11 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
       if (endpoint === 'skills/list') return session(principal, request.sessionId)
       if (endpoint === 'fileReferences/list') return agent(principal, args)
       if (endpoint === 'sessionReferenceResolver/candidates') return agent(principal, args)
-      if (endpoint === 'fileUploads/upload') return agent(principal, args)
+      if (endpoint === 'fileUploads/upload') return agentWrite(principal, args)
       if (endpoint === 'commands/list') return agent(principal, args)
-      if (namespace === 'goals') return agent(principal, args)
-      if (namespace === 'messageFeedback') return session(principal, request.sessionId)
-      if (endpoint === 'sessionFeedback/record') return session(principal, request.sessionId)
+      if (namespace === 'goals') return agentWrite(principal, args)
+      if (namespace === 'messageFeedback') return sessionWrite(principal, request.sessionId)
+      if (endpoint === 'sessionFeedback/record') return sessionWrite(principal, request.sessionId)
       // Commands may change permissions, filesystem access or plugins; deployments opt in per command.
       // Settings/credentials/plugins/presets/directory picking/dynamic Cordis stay administrator-only.
       return false

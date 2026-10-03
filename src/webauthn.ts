@@ -1,5 +1,5 @@
 /**
- * Passkey (WebAuthn) support for dsh-ui-auth.
+ * Passkey (WebAuthn) support for dsh-ui-auth-groups.
  *
  * Scope of this module:
  * - resolve the relying party (rpId / origin / display name) from the browser-visible

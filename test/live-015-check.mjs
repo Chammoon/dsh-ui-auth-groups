@@ -11,7 +11,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
  *
  * 用法：
  *   DSH015_URL=http://127.0.0.1:3201 \
- *   DSH015_BOOTSTRAP=<临时工作目录>/dsh-ui-auth-bootstrap.txt \
+ *   DSH015_BOOTSTRAP=<临时工作目录>/dsh-ui-auth-groups-bootstrap.txt \
  *   node test/live-015-check.mjs
  *
  * 覆盖：登录门 / 原生 carrier 桥接（登录后 DSH UI 可用）/ slash Remote 授权 /

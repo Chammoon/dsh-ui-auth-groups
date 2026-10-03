@@ -1,7 +1,7 @@
 {
-  "name": "dsh-ui-auth",
+  "name": "dsh-ui-auth-groups",
   "version": "0.7.0",
-  "description": "DSH Web UI 认证网关：登录保护全部 HTTP/WS 接口；用户管理、邀请码注册、TOTP 两步验证与通行密钥（Passkey/WebAuthn）登录。",
+  "description": "DSH Web UI 认证网关（二开）：登录保护全部 HTTP/WS 接口；用户/组管理、邀请码注册、TOTP 与通行密钥登录；会话权限=仅本人可写、同组可读、管理员可读。",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
@@ -15,6 +15,7 @@
     "docs",
     "assets",
     "cordis.patch.yml",
+    "FORK.md",
     "LICENSE",
     "README.md",
     "CHANGELOG.md",
@@ -23,7 +24,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node build/client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json",
-    "test": "npm run build && node --check lib/index.js && node --check lib/webauthn.js && node --check lib/client.js && node --check lib/passkey-browser.js && node --check lib/modern-gateway.js && node --check lib/modern-policy.js && node test/crypto-vectors.cjs && node test/totp-vectors.mjs && node test/client-smoke.cjs && node test/host-smoke.mjs && node test/login-page-check.mjs && node test/security-suite.mjs && node test/modern-policy.test.mjs && node test/profile-crypto.test.mjs && node test/profile-envelope.test.mjs && node test/profile-service.test.mjs && node test/user-routes.test.mjs && node test/profile-keys.test.mjs && node test/i18n.test.mjs",
+    "test": "npm run build && node --check lib/index.js && node --check lib/webauthn.js && node --check lib/client.js && node --check lib/passkey-browser.js && node --check lib/modern-gateway.js && node --check lib/modern-policy.js && node --check lib/group-store.js && node --check lib/session-transcript.js && node test/crypto-vectors.cjs && node test/totp-vectors.mjs && node test/client-smoke.cjs && node test/host-smoke.mjs && node test/login-page-check.mjs && node test/security-suite.mjs && node test/modern-policy.test.mjs && node test/group-store.test.mjs && node test/group-policy.test.mjs && node test/session-transcript.test.mjs && node test/profile-crypto.test.mjs && node test/profile-envelope.test.mjs && node test/profile-service.test.mjs && node test/user-routes.test.mjs && node test/profile-keys.test.mjs && node test/i18n.test.mjs",
     "prepack": "npm test",
     "verify:clean": "npm run build && git diff --exit-code -- lib",
     "store:check": "node test/store-contract-check.mjs",
@@ -79,7 +80,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/0QwQ0/dsh-ui-auth.git"
+    "url": "git+https://github.com/Chammoon/dsh-ui-auth-groups.git"
+  },
+  "homepage": "https://github.com/Chammoon/dsh-ui-auth-groups#readme",
+  "bugs": {
+    "url": "https://github.com/Chammoon/dsh-ui-auth-groups/issues"
   },
   "license": "MIT",
   "devDependencies": {

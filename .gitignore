@@ -8,6 +8,9 @@ node_modules/
 .DS_Store
 Thumbs.db
 
-# 运行时产物（由插件在首次启动生成，不应入库）
-dsh-ui-auth-bootstrap.txt
-dsh-ui-auth-init.log
+# 运行时产物（由插件在首次启动/运行中生成，不应入库）
+dsh-ui-auth-groups-bootstrap.txt
+dsh-ui-auth-groups-init.log
+dsh-ui-auth-groups-sessions.json
+dsh-ui-auth-groups-groups.json
+dsh-ui-auth-groups-groups.json.corrupt-*

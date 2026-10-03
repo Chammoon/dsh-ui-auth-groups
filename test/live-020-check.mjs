@@ -11,7 +11,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
  *
  * 用法：
  *   DSH020_URL=http://127.0.0.1:3202 \
- *   DSH020_BOOTSTRAP=<临时工作目录>/dsh-ui-auth-bootstrap.txt \
+ *   DSH020_BOOTSTRAP=<临时工作目录>/dsh-ui-auth-groups-bootstrap.txt \
  *   node test/live-020-check.mjs
  *
  * 覆盖：登录门 / 原生 carrier 桥接 / slash Remote 授权 / 普通用户隔离 /

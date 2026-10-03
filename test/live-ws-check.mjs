@@ -1,6 +1,6 @@
 // ============================================================================
 // live-ws-check.mjs —— 真实部署 WS 事件流隔离验证（0.4.0）
-// 需要：面板已运行且已安装 dsh-ui-auth（test1/12345678 登录）。
+// 需要：面板已运行且已安装 dsh-ui-auth-groups（test1/12345678 登录）。
 // 验证：1) 登录 test1，取 session.list / workspace.list（网关过滤后）的归属集合；
 //       2) 原始 TCP 连 /api/events.mux 与 /api/events.host；
 //       3) 断言网络层收到的每一帧（除 stream/error）的 sessionId/workspaceId

@@ -69,12 +69,45 @@ const modernConnection = {
 
 // ---- mock ctx ----
 const disposers = []
+// 会话查询服务（管理员「按用户浏览会话」用）：形状对齐真实 DSH session-query 服务
+// —— listSessions 给 { header:{id,createdAt,cwd}, live, persisted }，readTitle 给 { title }，
+// readSession 给 { session, events }，事件形状取自真实会话日志。
+const fakeSessions = {
+  'session-alpha': { title: '甲的会话', live: true, createdAt: 1700000000000 },
+  'session-beta': { title: '乙的会话', live: false, createdAt: 1700000100000 },
+}
+const sessionQueryMock = {
+  async listSessions() {
+    return Object.entries(fakeSessions).map(([id, s]) => ({
+      header: { id, createdAt: s.createdAt, cwd: '/tmp/' + id },
+      live: s.live,
+      persisted: true,
+    }))
+  },
+  async readTitle(id) {
+    const s = fakeSessions[id]
+    return s === undefined ? undefined : { title: s.title }
+  },
+  async readSession(id) {
+    if (fakeSessions[id] === undefined) throw new Error('session not found')
+    return {
+      session: { createdAt: fakeSessions[id].createdAt, cwd: '/tmp/' + id },
+      events: [
+        { type: 'user/message', seq: 1, time: 1700000000001, data: { content: [{ type: 'text', text: '用户问的问题' }], source: { kind: 'user' } } },
+        { type: 'user/message', seq: 2, time: 1700000000002, data: { content: [{ type: 'text', text: '注入的 AGENTS.md' }], source: { kind: 'injected-context' } } },
+        { type: 'assistant/message', seq: 3, time: 1700000000003, data: { message: { role: 'assistant', content: [{ type: 'reasoning', text: '不该出现的思考' }, { type: 'text', text: '助手的回答' }] } } },
+        { type: 'session/title', seq: 4, time: 1700000000004, data: { title: '甲的会话' } },
+      ],
+    }
+  },
+}
 const ctx = {
   get(name2) {
     if (name2 === 'credentials') return creds
     if (name2 === 'fs') return fsMock
     if (name2 === 'webServer') return { server }
     if (name2 === 'connection') return modernConnection
+    if (name2 === 'sessionQuery') return sessionQueryMock
     return undefined
   },
   effect(cb) { disposers.push(cb) },
@@ -82,7 +115,7 @@ const ctx = {
 }
 
 console.log('exports: name=' + name + ' inject=' + JSON.stringify(inject))
-check('exports.name', name === 'dsh-ui-auth')
+check('exports.name', name === 'dsh-ui-auth-groups')
 check('exports.inject', Array.isArray(inject) && inject.includes('webServer'))
 
 // ---- helpers ----
@@ -150,7 +183,7 @@ apply(ctx)
 
 // ---- wait for async init + bootstrap ----
 await new Promise((r) => setTimeout(r, 300))
-const bootstrapFile = fsFiles.get('dsh-ui-auth-bootstrap.txt')
+const bootstrapFile = fsFiles.get('dsh-ui-auth-groups-bootstrap.txt')
 check('bootstrap file written', bootstrapFile !== undefined)
 const pwMatch = bootstrapFile ? /密码:\s+(\S+)/.exec(bootstrapFile) : null
 const adminPassword = pwMatch ? pwMatch[1] : null
@@ -232,9 +265,91 @@ let bobCookie
   const res = await post('/auth/rpc/listUsers', bobCookie, '{}')
   check('bob (user) listUsers 403', res.status === 403, res.body)
 }
+// ---- 9b) 组管理：仅管理员可增删改查组与成员；普通用户只读自己所在的组 ----
+let groupId
+{
+  const res = await post('/auth/rpc/createGroup', adminCookie, JSON.stringify({ name: '项目 A', members: ['bob'] }))
+  const j = parseJson(res)
+  groupId = j.group && j.group.id
+  check('createGroup 带成员', j.ok === true && j.group.members.length === 1 && j.group.members[0] === 'bob', res.body)
+}
+{
+  const res = await post('/auth/rpc/createGroup', adminCookie, JSON.stringify({ name: '项目 A' }))
+  check('createGroup 重名 400', res.status === 400, res.body)
+}
+{
+  const res = await post('/auth/rpc/createGroup', adminCookie, JSON.stringify({ name: '项目 B', members: ['nobody'] }))
+  check('createGroup 未知成员 400', res.status === 400, res.body)
+}
+for (const method of ['listGroups', 'createGroup', 'renameGroup', 'setGroupMembers', 'removeGroup']) {
+  const res = await post('/auth/rpc/' + method, bobCookie, JSON.stringify({ name: 'x', id: groupId, members: [] }))
+  check('bob (user) ' + method + ' 403（成员只能由管理员分配）', res.status === 403, res.body)
+}
+{
+  const res = await post('/auth/rpc/myGroups', bobCookie, '{}')
+  const j = parseJson(res)
+  check('bob myGroups 只读自己所在的组', j.ok === true && j.groups.length === 1 && j.groups[0].name === '项目 A', res.body)
+}
+{
+  const res = await post('/auth/rpc/setGroupMembers', adminCookie, JSON.stringify({ id: groupId, members: ['bob', 'admin'] }))
+  const j = parseJson(res)
+  check('setGroupMembers 管理员', j.ok === true && j.group.members.length === 2, res.body)
+}
+{
+  const res = await post('/auth/rpc/renameGroup', adminCookie, JSON.stringify({ id: groupId, name: '项目 A2' }))
+  check('renameGroup 管理员', parseJson(res).group.name === '项目 A2', res.body)
+}
+{
+  const res = await post('/auth/rpc/listGroups', adminCookie, '{}')
+  const j = parseJson(res)
+  check('listGroups 管理员可见全部组', j.ok === true && j.groups.length === 1, res.body)
+}
+// ---- 9c) 按用户浏览会话：仅管理员；转录只读且跳过思考/注入上下文 ----
+{
+  const res = await post('/auth/rpc/adminSessionsByUser', adminCookie, '{}')
+  const j = parseJson(res)
+  const total = j.users ? j.users.reduce((n, u) => n + u.sessions.length, 0) : -1
+  const titled = j.users ? j.users.flatMap((u) => u.sessions).filter((s) => s.title !== undefined).length : -1
+  check('adminSessionsByUser 列出全部会话并带标题', j.ok === true && total === 2 && titled === 2, res.body)
+}
+{
+  const res = await post('/auth/rpc/adminSessionRead', adminCookie, JSON.stringify({ id: 'session-alpha' }))
+  const j = parseJson(res)
+  const rows = j.transcript ? j.transcript.messages.map((m) => m.role + ':' + m.text) : []
+  check('adminSessionRead 只读转录（跳过思考块与注入上下文）',
+    j.ok === true && rows.join('|') === 'user:用户问的问题|assistant:助手的回答', res.body)
+  check('adminSessionRead 带标题与归属', j.transcript.title === '甲的会话' && j.owner === 'admin', res.body)
+}
+{
+  const res = await post('/auth/rpc/adminSessionRead', adminCookie, JSON.stringify({ id: '不存在' }))
+  check('adminSessionRead 未知会话 404', res.status === 404, res.body)
+}
+{
+  const res = await post('/auth/rpc/adminSessionRead', adminCookie, '{}')
+  check('adminSessionRead 缺少 id 400', res.status === 400, res.body)
+}
+for (const method of ['adminSessionsByUser', 'adminSessionRead']) {
+  const res = await post('/auth/rpc/' + method, bobCookie, JSON.stringify({ id: 'session-alpha' }))
+  check('bob (user) ' + method + ' 403', res.status === 403, res.body)
+}
 {
   const res = await post('/auth/rpc/deleteUser', adminCookie, JSON.stringify({ username: 'bob' }))
   check('deleteUser bob', parseJson(res).ok === true, res.body)
+}
+// 账户删除后必须自动摘除组成员关系（否则同名新账户会继承旧的项目可见性）
+{
+  const res = await post('/auth/rpc/listGroups', adminCookie, '{}')
+  const j = parseJson(res)
+  const members = j.groups[0] !== undefined ? j.groups[0].members : []
+  check('删除账户后自动摘除组成员', members.indexOf('bob') === -1, res.body)
+}
+{
+  const res = await post('/auth/rpc/removeGroup', adminCookie, JSON.stringify({ id: groupId }))
+  check('removeGroup 管理员', parseJson(res).ok === true, res.body)
+}
+{
+  const res = await post('/auth/rpc/listGroups', adminCookie, '{}')
+  check('removeGroup 后组列表为空', parseJson(res).groups.length === 0, res.body)
 }
 // bob's session is now invalid
 {
@@ -371,7 +486,7 @@ if (disposers.length > 0) {
   const cookie16 = cookieOf(loginRes)
   check('sess: 登录成功', cookie16 !== undefined, 'status=' + loginRes.status + ' body=' + loginRes.body)
   await new Promise((r) => setTimeout(r, 100)) // 等 persistSessions 落盘
-  const file = fsFiles.get('dsh-ui-auth-sessions.json')
+  const file = fsFiles.get('dsh-ui-auth-groups-sessions.json')
   check('sess: 登录后会话文件已落盘', file !== undefined && file.includes('"sessions"'), 'file=' + (file !== undefined ? file.slice(0, 90) : '(missing)'))
   check('sess: 落盘不含明文 token（哈希化，64 位 hex key）', file !== undefined && !file.includes(cookie16) && /[0-9a-f]{64}/.test(file), 'file=' + (file !== undefined ? file.slice(0, 90) : '(missing)'))
   // 模拟"重启"：新 server + 新 ctx（共享同一 credentials 与 fs 存储），再 apply 一次
@@ -400,7 +515,7 @@ if (disposers.length > 0) {
   // 过期会话不恢复：把磁盘上的 expiresAt 改为过去，再"重启"
   const data = JSON.parse(file)
   for (const token of Object.keys(data.sessions)) data.sessions[token].expiresAt = 1
-  fsFiles.set('dsh-ui-auth-sessions.json', JSON.stringify(data))
+  fsFiles.set('dsh-ui-auth-groups-sessions.json', JSON.stringify(data))
   const serverR3 = new EventEmitter()
   serverR3.on('request', () => {})
   const ctxR3 = {
@@ -456,7 +571,7 @@ if (disposers.length > 0) {
     setTimeout(() => resolve(r), 80)
   })
   await new Promise((r) => setTimeout(r, 120))
-  const auditFile = fsFiles.get('dsh-ui-auth-audit.jsonl')
+  const auditFile = fsFiles.get('dsh-ui-auth-groups-audit.jsonl')
   check('audit: 成功操作已记录（createUser carol）', auditFile !== undefined && auditFile.includes('createUser') && auditFile.includes('carol'), 'audit=' + (auditFile !== undefined ? auditFile.slice(0, 120) : '(missing)'))
   // 普通用户越权尝试
   const carolLogin = await new Promise((resolve) => {
@@ -473,7 +588,7 @@ if (disposers.length > 0) {
   })
   check('audit: 越权尝试 403', deniedRes.status === 403)
   await new Promise((r) => setTimeout(r, 120))
-  const auditFile2 = fsFiles.get('dsh-ui-auth-audit.jsonl')
+  const auditFile2 = fsFiles.get('dsh-ui-auth-groups-audit.jsonl')
   check('audit: 越权尝试已记录（denied:true）', auditFile2 !== undefined && auditFile2.includes('"denied":true'), 'audit=' + (auditFile2 !== undefined ? auditFile2.slice(0, 160) : '(missing)'))
   const lines = (auditFile2 !== undefined ? auditFile2.trim().split('\n') : [])
   check('audit: 每一行都是合法 JSON（JSONL）', lines.length >= 2 && lines.every((l) => { try { JSON.parse(l); return true } catch (e) { return false } }))
@@ -781,13 +896,13 @@ if (disposers.length > 0) {
     serverE.emit('request', makeReq(method, path, cookie, body === undefined ? undefined : JSON.stringify(body)), r)
     setTimeout(() => resolve(r), 80)
   })
-  const before = fsFiles.get('dsh-ui-auth-bootstrap.txt')
+  const before = fsFiles.get('dsh-ui-auth-groups-bootstrap.txt')
   check('boot: 引导文件存在（自毁前置）', before !== undefined)
   const adminE = cookieOf(await callE('POST', '/auth/login', { username: 'admin', password: adminPassword }))
   const change = await callE('POST', '/auth/rpc/changePassword', { oldPassword: adminPassword, newPassword: 'boot-pw-1234' }, adminE)
   check('boot: 改密成功', change.status === 200)
   await new Promise((r) => setTimeout(r, 120))
-  const after = fsFiles.get('dsh-ui-auth-bootstrap.txt')
+  const after = fsFiles.get('dsh-ui-auth-groups-bootstrap.txt')
   check('boot: 改密后引导文件自毁（auto-unlink）', after === undefined)
   // 还原 admin 密码（场景 21 为最后一个场景，仍保持状态整洁）
   const adminE2 = cookieOf(await callE('POST', '/auth/login', { username: 'admin', password: 'boot-pw-1234' }))

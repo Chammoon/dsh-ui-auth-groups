@@ -23,7 +23,7 @@ export interface Entry {
 
 /** 词典：按命名空间分组，键为语义化 key。 */
 export const DICTIONARY = {
-  'dsh-ui-auth': {
+  'dsh-ui-auth-groups': {
     // —— 通用 ——
     'common.unlock': { zh: '解锁', en: 'Unlock' },
     'common.add': { zh: '添加', en: 'Add' },
@@ -114,11 +114,11 @@ export const DICTIONARY = {
 } as const
 
 export type Namespace = keyof typeof DICTIONARY
-export type MessageKey = keyof (typeof DICTIONARY)['dsh-ui-auth']
+export type MessageKey = keyof (typeof DICTIONARY)['dsh-ui-auth-groups']
 
 /** 取某语言的词条；缺失时回退中文原文（分批翻译期间不会出现空白文案）。 */
 export function message(locale: Locale, key: MessageKey, params?: Record<string, unknown>): string {
-  const entry = DICTIONARY['dsh-ui-auth'][key] as Entry | undefined
+  const entry = DICTIONARY['dsh-ui-auth-groups'][key] as Entry | undefined
   const template = entry === undefined ? String(key) : (locale === 'en' ? entry.en : entry.zh)
   if (params === undefined) return template
   return template.replace(/\{(\w+)\}/g, (match, name: string) => (name in params ? String(params[name]) : match))
@@ -154,7 +154,7 @@ export function localeFromAcceptLanguage(header: string | undefined): Locale | u
 export function dictionaries(): { zh: Record<string, string>; en: Record<string, string> } {
   const zh: Record<string, string> = {}
   const en: Record<string, string> = {}
-  for (const [key, entry] of Object.entries(DICTIONARY['dsh-ui-auth']) as Array<[string, Entry]>) {
+  for (const [key, entry] of Object.entries(DICTIONARY['dsh-ui-auth-groups']) as Array<[string, Entry]>) {
     zh[key] = entry.zh
     en[key] = entry.en
   }

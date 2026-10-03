@@ -69,7 +69,7 @@ for (const [index, version] of versions.entries()) {
       results.push({ version, installed: true, booted: false })
       continue
     }
-    const bootstrap = path.join(root, 'work', 'dsh-ui-auth-bootstrap.txt')
+    const bootstrap = path.join(root, 'work', 'dsh-ui-auth-groups-bootstrap.txt')
     const check = sh('node', [path.join(REPO, 'test', 'live-020-check.mjs')], {
       env: { ...env, DSH020_URL: `http://127.0.0.1:${port}`, DSH020_BOOTSTRAP: bootstrap },
       cwd: REPO,

@@ -59,6 +59,11 @@ export interface ModernAuth {
   claimSession(id: string, username: string): Promise<void>
   claimWorkspace(id: string, username: string): Promise<void>
   /**
+   * 组可见性：`viewer` 与 `owner` 是否至少同属一个组（组会话只读共享）。
+   * 未提供该回调 = 本部署未启用组功能，全部行为与上游一致。
+   */
+  sharesGroup?(viewer: string, owner: string): boolean
+  /**
    * R2：按登录用户返回模型授权范围（provider + 逐模型）。返回 undefined 表示不裁剪；
    * 管理员在策略层直接绕过，不会走到这里。
    */
@@ -225,6 +230,10 @@ function errorMessage(error: unknown): string {
 export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth): ModernGateway {
   const policy: ModernPolicy = createModernPolicy(auth, {
     ...(auth.entitlement === undefined ? {} : { entitlement: auth.entitlement }),
+    // 组可见性接线：读谓词由此获得「同组可读」能力（写谓词不受影响）。
+    ...(auth.sharesGroup === undefined
+      ? {}
+      : { sharesGroup: (viewer: string, owner: string): boolean => auth.sharesGroup?.(viewer, owner) === true }),
   })
   const policies = new Map<string, PolicyRules>()
   const principalByRequest = new WeakMap<IncomingMessage, Principal>()
@@ -276,7 +285,7 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
     // ALSO mirrored back to the browser (see handleHttp): the app's own connection module needs to
     // hold a carrier of its own to finish its handshake, and without it the client loops on
     // "connection lost". Mirroring is safe because the outer gate still demands a live
-    // dsh-ui-auth session before anything is forwarded.
+    // dsh-ui-auth-groups session before anything is forwarded.
     let cookie: string | undefined
     let carrier: string | undefined
     try {
@@ -392,7 +401,7 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
         delete (res.getHeaders?.() as Record<string, unknown>)[header]
         res.removeHeader?.(header)
       }
-      console.error('[dsh-ui-auth] modern gateway projection failed: ' + errorMessage(error))
+      console.error('[dsh-ui-auth-groups] modern gateway projection failed: ' + errorMessage(error))
       if (!res.headersSent) json(res, 502, { error: 'Could not persist or project response' })
       else res.destroy()
     }
@@ -521,6 +530,6 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
     sockets.close()
     policies.clear()
     correlations.clear()
-  }, 'dsh-ui-auth: modern gateway')
+  }, 'dsh-ui-auth-groups: modern gateway')
   return { handleHttp, handleUpgrade, publicApi }
 }

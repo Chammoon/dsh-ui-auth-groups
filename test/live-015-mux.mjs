@@ -1,7 +1,7 @@
 /**
  * live-015-mux.mjs — `/api/remote.mux` 流与逐帧隔离验收（隔离 0.1.5 实例）。
  *
- * 用法：DSH015_URL=http://127.0.0.1:3201 DSH015_BOOTSTRAP=<work>/dsh-ui-auth-bootstrap.txt \
+ * 用法：DSH015_URL=http://127.0.0.1:3201 DSH015_BOOTSTRAP=<work>/dsh-ui-auth-groups-bootstrap.txt \
  *       node test/live-015-mux.mjs
  */
 import { readFileSync } from 'node:fs'

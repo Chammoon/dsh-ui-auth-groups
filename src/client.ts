@@ -1,5 +1,5 @@
 		/**
-		 * dsh-ui-auth 客户端源码 —— DSH 客户端模块契约 factory 函数体的 TypeScript 版本。
+		 * dsh-ui-auth-groups 客户端源码 —— DSH 客户端模块契约 factory 函数体的 TypeScript 版本。
 		 *
 		 * 本文件是 lib/client.js（已构建产物）factory 体的逐行移植：只加类型标注，不改逻辑。
 		 * 构建用 `node build/client.mjs`（esbuild 打成 CJS），
@@ -247,10 +247,10 @@
 
 		function injectAuthCss() {
 			if (typeof document === "undefined") return
-			if (document.querySelector("style[data-plugin-css=\"dsh-ui-auth\"]") !== null) return
+			if (document.querySelector("style[data-plugin-css=\"dsh-ui-auth-groups\"]") !== null) return
 			var tag = document.createElement("style")
-			tag.dataset.plugin = "dsh-ui-auth"
-			tag.dataset.pluginCss = "dsh-ui-auth"
+			tag.dataset.plugin = "dsh-ui-auth-groups"
+			tag.dataset.pluginCss = "dsh-ui-auth-groups"
 			tag.textContent = AUTH_CSS
 			document.head.appendChild(tag)
 		}
@@ -1344,6 +1344,293 @@
 			return React.createElement('div', { className: 'dshua' }, React.createElement('div', { className: 'card' }, children))
 		}
 
+		// ============ 组管理（组 = 项目；成员只能由管理员分配） ============
+		/**
+		 * 权限模型：本人可写 / 组内其他人可读 / 管理员可读。
+		 * 管理员在此增删改查组与成员；普通用户只读自己所在的组。
+		 */
+		function GroupsPage() {
+			var _s = React.useState, _e = React.useEffect
+			var meS = _s(null), me = meS[0], setMe = meS[1]
+			var groupsS = _s([]), groups = groupsS[0], setGroups = groupsS[1]
+			var usersS = _s([]), users = usersS[0], setUsers = usersS[1]
+			var errS = _s(''), err = errS[0], setErr = errS[1]
+			var msgS = _s(''), msg = msgS[0], setMsg = msgS[1]
+			var busyS = _s(false), busy = busyS[0], setBusy = busyS[1]
+			var nameS = _s(''), name = nameS[0], setName = nameS[1]
+			var editingS = _s(null as any), editing = editingS[0], setEditing = editingS[1]
+			var draftMembersS = _s([] as string[]), draftMembers = draftMembersS[0], setDraftMembers = draftMembersS[1]
+			var draftNameS = _s(''), draftName = draftNameS[0], setDraftName = draftNameS[1]
+
+			function load(): void {
+				rpc('me', {}).then(function (j) {
+					setMe(j.me || null)
+					if (j.me !== undefined && j.me.role === 'admin') {
+						rpc('listUsers', {}).then(function (u) { setUsers(u.users || []) }).catch(function () { /* 成员选择器降级 */ })
+						return rpc('listGroups', {}).then(function (g) { setGroups(g.groups || []) })
+					}
+					return rpc('myGroups', {}).then(function (g) { setGroups(g.groups || []) })
+				}).catch(function (e) { setErr(errText(e)) })
+			}
+			_e(function () { load() }, [])
+
+			function run(p: Promise<any>, done?: string): void {
+				setBusy(true); setErr(''); setMsg('')
+				p.then(function () {
+					setBusy(false); setEditing(null); if (done !== undefined) setMsg(done); load()
+				}).catch(function (e) { setBusy(false); setErr(errText(e)) })
+			}
+			function isAdmin(): boolean { return me !== null && me.role === 'admin' }
+			function editMembers(group: any): void {
+				setEditing({ id: group.id, mode: 'members' })
+				setDraftMembers((group.members || []).slice())
+			}
+			function toggleMember(username: string): void {
+				setDraftMembers(function (prev: string[]) {
+					return prev.indexOf(username) === -1
+						? prev.concat([username])
+						: prev.filter(function (u) { return u !== username })
+				})
+			}
+
+			var rows = groups.map(function (group: any) {
+				var members: string[] = group.members || []
+				var isEditing = editing !== null && editing.id === group.id
+				var memberCell = members.length === 0
+					? React.createElement('span', { className: 'muted' }, '暂无成员')
+					: React.createElement('span', null, members.join('、'))
+				var actions: any[] = []
+				if (isAdmin()) {
+					actions.push(React.createElement('button', {
+						key: 'm', className: 'ghost', disabled: busy,
+						onClick: function () { isEditing && editing.mode === 'members' ? setEditing(null) : editMembers(group) },
+					}, isEditing && editing.mode === 'members' ? '收起' : '成员'))
+					actions.push(React.createElement('button', {
+						key: 'r', className: 'ghost', disabled: busy,
+						onClick: function () { isEditing && editing.mode === 'rename' ? setEditing(null) : (setEditing({ id: group.id, mode: 'rename' }), setDraftName(group.name)) },
+					}, '重命名'))
+					actions.push(React.createElement('button', {
+						key: 'd', className: 'ghost', disabled: busy,
+						onClick: function () {
+							if (!confirm('删除组「' + group.name + '」？成员关系会一并移除，会话本身不受影响。')) return
+							run(rpc('removeGroup', { id: group.id }), '已删除组「' + group.name + '」')
+						},
+					}, '删除'))
+				}
+				var editor: any = null
+				if (isEditing && editing.mode === 'members') {
+					editor = React.createElement('div', { className: 'card' },
+						React.createElement('div', { className: 'muted' }, '勾选成员（只能由管理员分配）'),
+						React.createElement('div', null,
+							users.map(function (user: any) {
+								return React.createElement('label', { key: user.username },
+									React.createElement('input', {
+										type: 'checkbox',
+										checked: draftMembers.indexOf(user.username) !== -1,
+										onChange: function () { toggleMember(user.username) },
+									}),
+									user.username + (user.role === 'admin' ? '（管理员）' : ''),
+								)
+							}),
+						),
+						React.createElement('button', {
+							disabled: busy,
+							onClick: function () { run(rpc('setGroupMembers', { id: group.id, members: draftMembers }), '已更新「' + group.name + '」的成员') },
+						}, '保存成员'),
+					)
+				}
+				if (isEditing && editing.mode === 'rename') {
+					editor = React.createElement('div', { className: 'card' },
+						React.createElement('input', {
+							value: draftName,
+							onChange: function (ev: any) { setDraftName(ev.target.value) },
+						}),
+						React.createElement('button', {
+							disabled: busy,
+							onClick: function () { run(rpc('renameGroup', { id: group.id, name: draftName }), '已重命名') },
+						}, '保存名称'),
+					)
+				}
+				return React.createElement('tr', { key: group.id },
+					React.createElement('td', null, group.name),
+					React.createElement('td', null, memberCell),
+					React.createElement('td', null, actions.length === 0 ? React.createElement('span', { className: 'muted' }, '只读') : actions),
+					editor === null ? null : React.createElement('td', { colSpan: 3 }, editor),
+				)
+			})
+
+			var children: any[] = [
+				React.createElement('h2', { key: 'h' }, isAdmin() ? '组管理（管理员）' : '我的项目组'),
+				React.createElement('p', { key: 'p', className: 'muted' },
+					'组对应一个项目。会话权限：仅本人可写；同组成员可读；管理员可读（不可写他人会话）。'),
+				err === '' ? null : React.createElement('p', { key: 'e', className: 'err' }, err),
+				msg === '' ? null : React.createElement('p', { key: 'm', className: 'meta' }, msg),
+			]
+			if (isAdmin()) {
+				children.push(React.createElement('div', { key: 'new', className: 'row' },
+					React.createElement('input', {
+						placeholder: '新建组名（例如：项目 A）', value: name,
+						onChange: function (ev: any) { setName(ev.target.value) },
+					}),
+					React.createElement('button', {
+						disabled: busy,
+						onClick: function () {
+							var text = name.trim()
+							if (text === '') { setErr('组名不能为空'); return }
+							run(rpc('createGroup', { name: text, members: [] }), '已创建组「' + text + '」')
+							setName('')
+						},
+					}, '创建组'),
+				))
+			}
+			children.push(React.createElement('table', { key: 't' },
+				React.createElement('thead', null, React.createElement('tr', null,
+					React.createElement('th', null, '组名'),
+					React.createElement('th', null, '成员'),
+					React.createElement('th', null, '操作'),
+				)),
+				React.createElement('tbody', null, rows.length === 0
+					? React.createElement('tr', null, React.createElement('td', { colSpan: 3, className: 'muted' }, isAdmin() ? '还没有组' : '你还没有加入任何组'))
+					: rows),
+			))
+			return React.createElement('div', { className: 'dshua' }, children)
+		}
+
+		// ============ 按用户浏览会话（管理员；只读） ============
+		/**
+		 * 管理员视图：左侧用户 → 右侧该用户的会话 → 点开只读转录。
+		 *
+		 * 数据来自宿主 session-query 服务（`adminSessionsByUser` / `adminSessionRead`），
+		 * **纯读**：这里没有任何写回通道，管理员也不能代写他人会话。
+		 */
+		function SessionsByUserPage() {
+			var _s = React.useState, _e = React.useEffect
+			var usersS = _s([]), users = usersS[0], setUsers = usersS[1]
+			var loadingS = _s(true), loading = loadingS[0], setLoading = loadingS[1]
+			var errS = _s(''), err = errS[0], setErr = errS[1]
+			var metaS = _s(''), meta = metaS[0], setMeta = metaS[1]
+			var pickedS = _s(''), picked = pickedS[0], setPicked = pickedS[1]
+			var openS = _s(null as any), open = openS[0], setOpen = openS[1]
+
+			function refresh(): void {
+				setLoading(true); setErr('')
+				rpc('adminSessionsByUser', {}).then(function (j) {
+					setLoading(false)
+					setUsers(j.users || [])
+					setMeta(String(j.totalSessions || 0) + ' 个会话'
+						+ (j.titlesOmitted ? '（' + j.titlesOmitted + ' 个未取标题）' : ''))
+				}).catch(function (e) { setLoading(false); setErr(errText(e)) })
+			}
+			_e(function () { refresh() }, [])
+
+			function readSession(entry: any): void {
+				setOpen({ loading: true, error: '', sessionId: entry.id, title: entry.title || entry.id })
+				rpc('adminSessionRead', { id: entry.id }).then(function (j) {
+					setOpen({ loading: false, error: '', sessionId: j.sessionId, owner: j.owner,
+						title: (j.transcript && j.transcript.title) || entry.title || j.sessionId,
+						createdAt: j.createdAt, cwd: j.cwd, live: j.live, transcript: j.transcript })
+				}).catch(function (e) {
+					setOpen({ loading: false, error: errText(e), sessionId: entry.id, title: entry.title || entry.id })
+				})
+			}
+
+			function stamp(value: any): string {
+				if (typeof value !== 'number' || value <= 0) return '—'
+				try { return new Date(value).toLocaleString() } catch (e) { return '—' }
+			}
+
+			// —— 详情视图：只读转录 ——
+			if (open !== null) {
+				var detail: any[] = [
+					React.createElement('div', { key: 'bar', className: 'row' },
+						React.createElement('button', { className: 'ghost', onClick: function () { setOpen(null) } }, '← 返回列表'),
+						React.createElement('span', { className: 'meta' }, '只读视图（管理员可查看，不可代写）')),
+					React.createElement('h2', { key: 'h' }, open.title || open.sessionId),
+					React.createElement('p', { key: 'meta', className: 'muted' },
+						'归属：' + (open.owner || '—') + ' · 创建：' + stamp(open.createdAt)
+						+ (open.cwd ? ' · 目录：' + open.cwd : '')
+						+ (open.live ? ' · 打开过（有归属记录）' : '')),
+					open.error === '' ? null : React.createElement('p', { key: 'e', className: 'err' }, open.error),
+				]
+				if (open.loading === true) {
+					detail.push(React.createElement('p', { key: 'l', className: 'muted' }, '读取会话中…'))
+				} else if (open.transcript !== undefined) {
+					var t = open.transcript
+					detail.push(React.createElement('p', { key: 'sum', className: 'meta' },
+						'共 ' + t.messages.length + ' 条消息'
+						+ (t.droppedMessages > 0 ? '（较早的 ' + t.droppedMessages + ' 条未显示）' : '')
+						+ (t.truncatedMessages > 0 ? '，' + t.truncatedMessages + ' 条正文已截断' : '')
+						+ ' · 事件 ' + t.eventCount + ' 条'))
+					if (t.messages.length === 0) {
+						detail.push(React.createElement('p', { key: 'none', className: 'muted' }, '这个会话里没有可显示的对话内容。'))
+					}
+					t.messages.forEach(function (message: any, index: number) {
+						var isUser = message.role === 'user'
+						detail.push(React.createElement('div', { key: 'm' + index, className: 'card' },
+							React.createElement('div', { className: 'meta' },
+								(isUser ? '用户' : '助手')
+								+ (isUser && message.source && message.source !== 'user' ? '（注入上下文：' + message.source + '）' : '')
+								+ ' · ' + stamp(message.at) + ' · #' + message.seq),
+							React.createElement('div', { style: { whiteSpace: 'pre-wrap', marginTop: '6px' } }, message.text)))
+					})
+				}
+				return React.createElement('div', { className: 'dshua' }, detail)
+			}
+
+			// —— 列表视图：用户 → 会话 ——
+			var selected: any = null
+			for (var i = 0; i < users.length; i += 1) {
+				if (users[i].username === picked) { selected = users[i]; break }
+			}
+			if (selected === null && users.length > 0) selected = users[0]
+
+			var children: any[] = [
+				React.createElement('h2', { key: 'h' }, '按用户浏览会话（管理员）'),
+				React.createElement('p', { key: 'p', className: 'muted' },
+					'只读：可以查看任何用户的对话内容，但不能代写（写入仅限会话归属人本人）。'),
+				err === '' ? null : React.createElement('p', { key: 'e', className: 'err' }, err),
+				React.createElement('p', { key: 'm', className: 'meta' }, loading ? '加载中…' : meta),
+			]
+
+			var userRows = users.map(function (user: any) {
+				var isPicked = selected !== null && selected.username === user.username
+				return React.createElement('button', {
+					key: user.username,
+					className: isPicked ? '' : 'ghost',
+					style: { display: 'block', width: '100%', textAlign: 'left', marginBottom: '4px' },
+					onClick: function () { setPicked(user.username) },
+				}, user.username + '（' + user.sessions.length + '）')
+			})
+
+			var sessionRows: any[] = []
+			if (selected !== null) {
+				sessionRows = selected.sessions.map(function (entry: any) {
+					return React.createElement('div', { key: entry.id, className: 'card' },
+						React.createElement('div', { className: 'row' },
+							React.createElement('button', { onClick: function () { readSession(entry) } }, '打开'),
+							React.createElement('span', null, entry.title || '(无标题)')),
+						React.createElement('div', { className: 'meta' },
+							stamp(entry.createdAt) + ' · ' + entry.id + (entry.live ? ' · 运行中' : '')))
+				})
+				if (sessionRows.length === 0) {
+					sessionRows.push(React.createElement('p', { key: 'none', className: 'muted' }, '该用户还没有会话。'))
+				}
+			}
+
+			children.push(React.createElement('table', { key: 't' },
+				React.createElement('tbody', null, React.createElement('tr', null,
+					React.createElement('td', { style: { verticalAlign: 'top', width: '200px' } },
+						userRows.length === 0 ? React.createElement('span', { className: 'muted' }, '暂无数据') : userRows),
+					React.createElement('td', { style: { verticalAlign: 'top' } },
+						selected === null
+							? React.createElement('span', { className: 'muted' }, '选择左侧用户查看其会话')
+							: React.createElement('div', null,
+								React.createElement('p', { className: 'meta' }, '用户：' + selected.username),
+								sessionRows))))))
+
+			return React.createElement('div', { className: 'dshua' }, children)
+		}
+
 		// ============ 登录后 TOTP 提醒弹窗（未绑定且未永久忽略时；同一会话只弹一次） ============
 		function showTotpReminder() {
 			if (typeof document === "undefined") return
@@ -1386,7 +1673,7 @@
 		}
 
 		// ============ 插件入口 ============
-		exports.name = 'dsh-ui-auth'
+		exports.name = 'dsh-ui-auth-groups'
 		// slots 服务在 0.1.1-rc.2 由 @deepseek-ai/dsh-client-runtime 提供，0.1.5 起改由
 		// @deepseek-ai/dsh-client-ui-renderer 提供；同时 0.1.5 让客户端到达顺序变成显式
 		// 依赖（dsh.client.inject 不再只是信息性元数据）。不声明 inject 时本行可能先于
@@ -1513,8 +1800,8 @@
 			const bind = localeService?.bind
 			const effect = ctx.effect
 			if (register !== undefined && bind !== undefined && effect !== undefined) {
-				effect(function () { return register('dsh-ui-auth', dictionaries()) })
-				t = bind('dsh-ui-auth')
+				effect(function () { return register('dsh-ui-auth-groups', dictionaries()) })
+				t = bind('dsh-ui-auth-groups')
 			}
 			// 先应用一次（首帧即按当前语言渲染），并在 DSH 广播切换时重应用 + 让页面重渲染。
 			refreshLocale()
@@ -1531,13 +1818,20 @@
 			var slots = ctx.get('slots')
 			if (slots === undefined) {
 				if (attempt < 40) { setTimeout(function () { mountSettings(ctx, attempt + 1) }, 250); return }
-				console.error('[dsh-ui-auth] slots 服务不可用：设置面板「用户管理」未能注册')
+				console.error('[dsh-ui-auth-groups] slots 服务不可用：设置面板「用户管理」未能注册')
 				return
 			}
 			slots.inject('settings.section', function () {
 				return slots!.register(
 					{ name: 'settings.section', id: 'auth-users', order: 30, label: function () { return '用户管理' } },
 					function () { return React.createElement(AuthUsersPage) },
+				)
+			})
+			// 组（组 = 项目）：管理员可增删改查组与成员；普通用户只读自己所在的组。
+			slots.inject('settings.section', function () {
+				return slots!.register(
+					{ name: 'settings.section', id: 'auth-groups', order: 32, label: function () { return '组（项目）' } },
+					function () { return React.createElement(GroupsPage) },
 				)
 			})
 			// 普通用户：模型页改为**自己的**模型与 Key 面板（v0.7.0；不再隐藏出厂导航行）
@@ -1557,6 +1851,15 @@
 						return slots!.register(
 							{ name: 'settings.section', id: 'auth-shares', order: 31, label: function () { return t('shares.title') } },
 							function () { return React.createElement(SharesPage) },
+						)
+					})
+				}
+				// 管理员：按用户浏览会话（只读转录；普通用户不可见，服务端同样 requireAdmin）
+				if (j.me !== undefined && j.me.role === 'admin') {
+					slots!.inject('settings.section', function () {
+						return slots!.register(
+							{ name: 'settings.section', id: 'auth-sessions', order: 33, label: function () { return '按用户浏览会话' } },
+							function () { return React.createElement(SessionsByUserPage) },
 						)
 					})
 				}

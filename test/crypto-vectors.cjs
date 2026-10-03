@@ -1,5 +1,5 @@
 // Standalone validation of the pure-JS SHA-256 / HMAC-SHA256 / PBKDF2
-// implementation that will be embedded in the dsh-ui-auth plugin host half.
+// implementation that will be embedded in the dsh-ui-auth-groups plugin host half.
 // Run: node crypto-check.js
 
 function rotr(x, n) { return ((x >>> n) | (x << (32 - n))) >>> 0 }

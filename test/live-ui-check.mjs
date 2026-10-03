@@ -91,7 +91,7 @@ try {
   await browser.close()
 }
 
-const pluginErrors = consoleLines.filter(line => line.includes('dsh-ui-auth'))
+const pluginErrors = consoleLines.filter(line => line.includes('dsh-ui-auth-groups'))
 check('页面无插件级错误日志', pluginErrors.filter(line => line.includes('error') || line.includes('[Error]')).length === 0,
   pluginErrors.slice(0, 3).join(' / ') || 'none')
 if (pageErrors.length > 0) console.log('page errors:', pageErrors.slice(0, 5).join(' | '))

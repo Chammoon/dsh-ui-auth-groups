@@ -1,11 +1,27 @@
-# dsh-ui-auth — DSH Web UI 认证网关插件
+# dsh-ui-auth-groups — DSH Web UI 认证网关插件（二开：组 + 会话权限）
 
 > **面向：**首次接触本插件的用户。
 
-[![Awesome DSH Plugin](https://awesome-dsh-plugin.com/badge.svg)](https://awesome-dsh-plugin.com)
-[![npm version](https://img.shields.io/npm/v/dsh-ui-auth.svg)](https://www.npmjs.com/package/dsh-ui-auth)
-[![npm downloads](https://img.shields.io/npm/dm/dsh-ui-auth.svg)](https://www.npmjs.com/package/dsh-ui-auth)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/0QwQ0/dsh-ui-auth)
+> ## 🧩 本包是二开版本
+>
+> 基于 [0QwQ0/dsh-ui-auth](https://github.com/0QwQ0/dsh-ui-auth) `v0.7.0`，在其认证网关与按用户隔离之上增加：
+>
+> - **组（组 = 项目）**：一个用户可属于多个组，一个组多名成员；组名唯一。
+> - **成员只能由管理员分配**：组的增删改查与成员管理全部仅管理员可用，并写审计。
+> - **会话权限模型**：**仅本人可写；组内其他人可读；管理员可读（不可写他人会话）**。
+> - 管理端新增设置面板「组（项目）」分区：管理员可增删改查组与成员；普通用户只读自己所在的组。
+> - 管理端新增「按用户浏览会话」分区：管理员按用户列出其全部会话，点开即读**只读转录**
+>   （只含真人输入与助手正文，跳过思考块、工具调用与注入上下文；跨用户读取写审计）。
+>
+> 上游文件的改动共 781 行，改法与跟随上游的步骤见 [`FORK.md`](./FORK.md)。
+> 与上游 `dsh-ui-auth` **不可同时安装**（同一 `uiAuth` 服务与插件行会冲突）。
+> 未接线组功能时行为与上游逐字节一致，由 `test/group-policy.test.mjs` 固化。
+
+[![fork of dsh-ui-auth](https://img.shields.io/badge/fork%20of-0QwQ0%2Fdsh--ui--auth%20v0.7.0-blue)](https://github.com/0QwQ0/dsh-ui-auth)
+[![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+
+> 本仓库未发布到 npm：按下方[安装](#安装)一节用 `dsh plugin add <git 地址或本地路径>` 挂载。
+> 上游 `dsh-ui-auth` 的 npm 徽章/文档不再适用于本 fork。
 
 ## 🔴 兼容性提示：legacy 版本（DSH 0.1.1-rc.2）的支持已于 v0.7.0 结束
 

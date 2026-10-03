@@ -1,5 +1,5 @@
 /**
- * dsh-ui-auth — DSH Web UI 认证网关（正式部署版 Host 半区）。
+ * dsh-ui-auth-groups — DSH Web UI 认证网关（正式部署版 Host 半区）。
  *
  * 在 DSH Web UI 的 node:http 服务器层拦截全部 HTTP 请求与 WebSocket 升级：
  * 未登录一律拒绝（页面请求重定向到登录页，API/静态资源返回 401，WS 升级销毁连接），
@@ -8,7 +8,7 @@
  * 用户数据持久化使用 credentials 服务（.credentials.yaml，每用户一条 grant 记录），
  * 密码以 PBKDF2-HMAC-SHA256（随机盐）存储，永不保存明文；令牌/盐优先使用
  * Web Crypto 强熵。首次启动自动创建管理员 admin（随机密码写入控制台日志与
- * dsh-ui-auth-bootstrap.txt）。
+ * dsh-ui-auth-groups-bootstrap.txt）。
  */
 
 import { createHash, randomUUID } from 'node:crypto'
@@ -17,6 +17,10 @@ import type { Duplex } from 'node:stream'
 import { createModernGateway } from './modern-gateway.js'
 import type { ModernGateway, ModernGatewayContext } from './modern-gateway.js'
 import type { Principal } from './modern-policy.js'
+import { GroupStore } from './group-store.js'
+import type { GroupRecord } from './group-store.js'
+import { buildTranscript, groupByOwner } from './session-transcript.js'
+import type { SessionRecordLike } from './session-transcript.js'
 import {
   MAX_PASSKEYS,
   assessRelyingParty,
@@ -41,7 +45,7 @@ import { localeFromAcceptLanguage, translateHtml, translatePhrase, type Locale }
 import { ProfileService } from './profile-service.js'
 import { UserRouteRegistry, createDeepSeekRegistrar, routeIdOf } from './user-routes.js'
 
-export const name = 'dsh-ui-auth'
+export const name = 'dsh-ui-auth-groups'
 export const inject = ['webServer', 'connection']
 
 /**
@@ -133,7 +137,7 @@ interface UiAuthState {
   invites: Map<string, InviteRecord>
 }
 
-/** `dsh-ui-auth-sessions.json` 文件形状（v1）。 */
+/** `dsh-ui-auth-groups-sessions.json` 文件形状（v1）。 */
 interface SessionsFile {
   v: number
   sessions: Record<string, SessionEntry>
@@ -396,6 +400,61 @@ export function clientIp(req: ClientIpRequest | undefined, trustProxy: boolean):
     }
     return typeof addr === 'string' ? addr : 'unknown'
   } catch (err) { return 'unknown' }
+}
+
+/**
+ * `ctx.get('sessionQuery')` 的最小结构面（DSH session-query 服务）。
+ *
+ * 用于管理员「按用户浏览会话」：`listSessions` 枚举全部会话、`readTitle` 取标题、
+ * `readSession` 取事件流做只读转录。任一方法缺席时对应功能优雅降级（返回 503 文案）。
+ */
+interface SessionQueryLike {
+  listSessions?(signal?: AbortSignal): Promise<SessionRecordLike[]>
+  readTitle?(sessionId: string, signal?: AbortSignal): Promise<{ title?: string } | undefined>
+  readSession?(sessionId: string): Promise<{ session?: { createdAt?: unknown; cwd?: unknown }; events?: unknown[] }>
+}
+
+/** 一次列表里最多补多少条标题（避免为几百个会话逐个读日志）。 */
+const TITLE_FETCH_LIMIT = 200
+/** 标题并发度与缓存 TTL：面板刷新时不必重读。 */
+const TITLE_CONCURRENCY = 8
+const TITLE_CACHE_TTL_MS = 60_000
+
+/**
+ * 组成员入参校验：只接受**已存在**的用户名（去重、限长、去空白）。
+ * 返回 `null` 表示已通过 `reject` 回复了错误，调用方应直接 return。
+ */
+function parseGroupMembers(
+  value: unknown,
+  exists: (username: string) => boolean,
+  reject: (message: string) => void,
+): string[] | null {
+  if (value === undefined || value === null) return []
+  if (!Array.isArray(value)) {
+    reject('成员列表必须是数组')
+    return null
+  }
+  const out: string[] = []
+  for (const item of value) {
+    const name = typeof item === 'string' ? item.trim().slice(0, 64) : ''
+    if (name === '') continue
+    if (!exists(name)) {
+      reject(`用户不存在：${name}`)
+      return null
+    }
+    if (!out.includes(name)) out.push(name)
+  }
+  return out
+}
+
+/** 组存储的错误转成面板可读文案。 */
+function groupErrorMessage(err: unknown): string {
+  const text = err instanceof Error ? err.message : String(err)
+  if (text.startsWith('group name already exists')) return '组名已存在'
+  if (text.startsWith('group not found')) return '组不存在'
+  if (text.startsWith('group name must not be empty')) return '组名不能为空'
+  if (text.startsWith('group name must be at most')) return '组名过长（最多 64 字符）'
+  return text
 }
 
 export function apply(ctx: CordisContext): void {
@@ -713,7 +772,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
           routeOwner.delete(profileId)
         }
       } catch (err) {
-        console.error('[dsh-ui-auth] 同步用户 provider 路由失败: ' + String(err))
+        console.error('[dsh-ui-auth-groups] 同步用户 provider 路由失败: ' + String(err))
       }
     }
 
@@ -729,19 +788,19 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
     const startUserRoutes = async (scoped: CordisContext): Promise<void> => {
       const register = await createDeepSeekRegistrar(scoped)
       if (register === undefined) {
-        console.error('[dsh-ui-auth] 宿主未提供 dsh-llm-deepseek / dsh-launch-environment：'
+        console.error('[dsh-ui-auth-groups] 宿主未提供 dsh-llm-deepseek / dsh-launch-environment：'
           + '按用户模型的调用路径（R1-ii）不可用；界面与存储隔离仍然生效，未配置的用户继续被阻断。')
         return
       }
       routeRegistry = new UserRouteRegistry({
         register,
-        onError: (message, error) => console.error(`[dsh-ui-auth] ${message}: ${String(error)}`),
+        onError: (message, error) => console.error(`[dsh-ui-auth-groups] ${message}: ${String(error)}`),
       })
       ctx.effect(() => () => {
         routeRegistry?.disposeAll()
         routeRegistry = null
         routeOwner.clear()
-      }, 'dsh-ui-auth: 释放用户 provider 路由')
+      }, 'dsh-ui-auth-groups: 释放用户 provider 路由')
       await syncAllRoutes()
     }
     // 作用域注入 `llm`：Cordis 要求声明注入后才能访问 `ctx.llm`（registerDeepSeekProvider 内部会用到），
@@ -883,14 +942,27 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
     }
 
     async function storeRemove(username: string): Promise<void> {
+      // 账户删除时同步摘除全部组成员关系，避免残留成员名被后续同名账户继承。
+      groups.removeMemberEverywhere(username)
       if (store !== null) return store.remove(username)
       state.users.delete(username)
     }
 
+    // ============ 组（组 = 项目） ============
+    // 组表落盘到 dsh-ui-auth-groups-groups.json（与会话表同处 fs 服务工作目录）。
+    // 读谓词是同步热路径（每次会话列表、工作区视图与事件帧过滤都会调用它），
+    // 所以内存索引是权威、磁盘只负责重启存活；装载失败保持空表 = 组内共享不生效
+    // （fail-closed，绝不退化成「全员可读」）。
+    const groups = new GroupStore(() => ctx.get('fs') as FsService | undefined)
+
+    // 会话标题缓存（管理员「按用户浏览会话」用）：标题来自事件流，逐个读代价高，
+    // 因此带 TTL 缓存；读不到就是没有标题，不影响列表本身。
+    const titleCache = new Map<string, { title: string | undefined; at: number }>()
+
     // ============ 会话 ============
-    // 会话持久化（0.4.0）：会话表落盘到 dsh-ui-auth-sessions.json（fs 服务工作目录），
+    // 会话持久化（0.4.0）：会话表落盘到 dsh-ui-auth-groups-sessions.json（fs 服务工作目录），
     // 重启后恢复未过期会话 —— token 明文落盘等价于"记住登录态"，文件仅属主可读写。
-    const SESSIONS_FILE = 'dsh-ui-auth-sessions.json'
+    const SESSIONS_FILE = 'dsh-ui-auth-groups-sessions.json'
     let sessionsDirty = false
 
     function persistSessions() {
@@ -901,7 +973,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
         const data: SessionsFile = { v: 1, sessions: {} }
         for (const [token, s] of state.sessions) data.sessions[token] = { username: s.username, expiresAt: s.expiresAt }
         sessionsDirty = false
-        fsSvc.resolve(SESSIONS_FILE).then((t) => fsSvc.writeText(t, JSON.stringify(data))).catch((err) => console.error('[dsh-ui-auth] 写入会话文件失败: ' + String(err)))
+        fsSvc.resolve(SESSIONS_FILE).then((t) => fsSvc.writeText(t, JSON.stringify(data))).catch((err) => console.error('[dsh-ui-auth-groups] 写入会话文件失败: ' + String(err)))
       } catch (err) { /* ignore */ }
     }
 
@@ -924,7 +996,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
           state.sessions.set(key, { username: s.username, expiresAt: Math.min(s.expiresAt, now + SESSION_TTL_MS) })
           loaded++
         }
-        if (loaded > 0) console.log('[dsh-ui-auth] 已恢复 ' + loaded + ' 个持久化会话（重启不掉线）')
+        if (loaded > 0) console.log('[dsh-ui-auth-groups] 已恢复 ' + loaded + ' 个持久化会话（重启不掉线）')
       } catch (err) { /* 文件不存在/损坏：从空会话开始 */ }
     }
 
@@ -1608,7 +1680,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
           passkeyBrowserScript = source
           passkeyBrowserEtag = '"' + toHex(sha256(new TextEncoder().encode(source))).slice(0, 32) + '"'
         } catch (err) {
-          console.error('[dsh-ui-auth] 读取通行密钥浏览器端脚本失败: ' + String(err))
+          console.error('[dsh-ui-auth-groups] 读取通行密钥浏览器端脚本失败: ' + String(err))
         }
       }
       if (passkeyBrowserScript === null) { sendJson(res, 500, { error: '通行密钥脚本不可用' }); return }
@@ -2536,10 +2608,10 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
             if (service !== undefined && store !== null) {
               const uid = await new ProfileStore(store).ensureUid(who)
               const count = await service.changePassword(uid, token ?? '', oldP, newP)
-              console.log(`[dsh-ui-auth] 改密：已重包裹 ${count} 条私有模型配置（${who}）`)
+              console.log(`[dsh-ui-auth-groups] 改密：已重包裹 ${count} 条私有模型配置（${who}）`)
             }
           } catch (err) {
-            console.error('[dsh-ui-auth] 改密重包裹私有配置失败（这些配置需重新录入）: ' + String(err))
+            console.error('[dsh-ui-auth-groups] 改密重包裹私有配置失败（这些配置需重新录入）: ' + String(err))
           }
           invalidateSessions(who, token)
           audit('changePassword', who, who)
@@ -2547,7 +2619,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
           try {
             const fsSvc: FsService | undefined = ctx.get('fs')
             if (fsSvc !== undefined) {
-              const target = await fsSvc.resolve('dsh-ui-auth-bootstrap.txt')
+              const target = await fsSvc.resolve('dsh-ui-auth-groups-bootstrap.txt')
               if (typeof fsSvc.unlink === 'function') {
                 await fsSvc.unlink(target)
               } else if (typeof fsSvc.processPath === 'function') {
@@ -2685,6 +2757,165 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
           sendJson(res, 200, { ok: true })
           return
         }
+        // ============ 组（组 = 项目；成员只能由管理员分配） ============
+        // 权限模型：组 CRUD 与成员增删改查**仅管理员**；普通用户只能读自己所在的组。
+        case 'listGroups': {
+          if (!requireAdmin()) return
+          sendJson(res, 200, { ok: true, groups: groups.list() })
+          return
+        }
+        case 'myGroups': {
+          // 任何登录用户都能看自己所在的组（「我的项目」与组会话面板用）。
+          sendJson(res, 200, { ok: true, groups: groups.groupsOf(who) })
+          return
+        }
+        case 'createGroup': {
+          if (!requireAdmin()) return
+          const name = str(args.name, 64)
+          const members = parseGroupMembers(args.members, (u) => state.users.has(u), (message) => sendJson(res, 400, { error: message }))
+          if (members === null) return
+          try {
+            const group = groups.create({ name, members })
+            audit('groupCreate', who, group.id, { name: group.name, members: group.members })
+            sendJson(res, 200, { ok: true, group })
+          } catch (err) {
+            sendJson(res, 400, { error: groupErrorMessage(err) })
+          }
+          return
+        }
+        case 'renameGroup': {
+          if (!requireAdmin()) return
+          const id = str(args.id, 64)
+          try {
+            const group = groups.rename(id, str(args.name, 64))
+            audit('groupRename', who, group.id, { name: group.name })
+            sendJson(res, 200, { ok: true, group })
+          } catch (err) {
+            sendJson(res, 400, { error: groupErrorMessage(err) })
+          }
+          return
+        }
+        case 'setGroupMembers': {
+          if (!requireAdmin()) return
+          const id = str(args.id, 64)
+          const members = parseGroupMembers(args.members, (u) => state.users.has(u), (message) => sendJson(res, 400, { error: message }))
+          if (members === null) return
+          try {
+            const group = groups.setMembers(id, members)
+            audit('groupMembers', who, group.id, { members: group.members })
+            sendJson(res, 200, { ok: true, group })
+          } catch (err) {
+            sendJson(res, 400, { error: groupErrorMessage(err) })
+          }
+          return
+        }
+        case 'removeGroup': {
+          if (!requireAdmin()) return
+          const id = str(args.id, 64)
+          try {
+            groups.remove(id)
+            audit('groupRemove', who, id)
+            sendJson(res, 200, { ok: true })
+          } catch (err) {
+            sendJson(res, 400, { error: groupErrorMessage(err) })
+          }
+          return
+        }
+        // ============ 管理员：按用户浏览会话（只读） ============
+        // 管理员的阅读权限由策略层放行（读=本人+同组+管理员），这里只做数据整形：
+        // 枚举全部会话 → 按归属人分组 → 需要时投影成只读转录。写入不在这里、也不可能在这里。
+        case 'adminSessionsByUser': {
+          if (!requireAdmin()) return
+          const query = ctx.get('sessionQuery') as SessionQueryLike | undefined
+          if (typeof query?.listSessions !== 'function') {
+            sendJson(res, 503, { error: '宿主未提供 sessionQuery 服务，无法枚举会话' })
+            return
+          }
+          let records: SessionRecordLike[]
+          try {
+            records = await query.listSessions()
+          } catch (err) {
+            sendJson(res, 500, { error: '读取会话列表失败：' + (err instanceof Error ? err.message : String(err)) })
+            return
+          }
+          // 标题最佳努力：带 TTL 缓存 + 并发上限；失败/超限就留空，绝不因此让列表失败。
+          const titles = new Map<string, string>()
+          const ids: string[] = []
+          for (const record of records) {
+            const id = record.header !== undefined && typeof record.header.id === 'string' ? record.header.id : ''
+            if (id !== '') ids.push(id)
+          }
+          const now = Date.now()
+          const pending = ids.slice(0, TITLE_FETCH_LIMIT).filter((id) => {
+            const hit = titleCache.get(id)
+            if (hit === undefined || now - hit.at > TITLE_CACHE_TTL_MS) return true
+            if (hit.title !== undefined) titles.set(id, hit.title)
+            return false
+          })
+          const readTitle = query.readTitle
+          if (typeof readTitle === 'function') {
+            for (let i = 0; i < pending.length; i += TITLE_CONCURRENCY) {
+              const slice = pending.slice(i, i + TITLE_CONCURRENCY)
+              await Promise.all(slice.map(async (id) => {
+                try {
+                  const snapshot = await readTitle.call(query, id)
+                  const title = snapshot !== undefined && typeof snapshot.title === 'string' && snapshot.title !== ''
+                    ? snapshot.title
+                    : undefined
+                  titleCache.set(id, { title, at: Date.now() })
+                  if (title !== undefined) titles.set(id, title)
+                } catch {
+                  titleCache.set(id, { title: undefined, at: Date.now() })
+                }
+              }))
+            }
+          }
+          const users = groupByOwner(records, ownerOfSession, titles)
+          const total = ids.length
+          sendJson(res, 200, {
+            ok: true,
+            users,
+            totalSessions: total,
+            titlesOmitted: Math.max(0, total - TITLE_FETCH_LIMIT),
+          })
+          return
+        }
+        case 'adminSessionRead': {
+          if (!requireAdmin()) return
+          const id = str(args.id, 128)
+          if (id === '') {
+            sendJson(res, 400, { error: '缺少会话 id' })
+            return
+          }
+          const query = ctx.get('sessionQuery') as SessionQueryLike | undefined
+          if (typeof query?.readSession !== 'function') {
+            sendJson(res, 503, { error: '宿主未提供 sessionQuery 服务，无法读取会话' })
+            return
+          }
+          let snapshot: { session?: { createdAt?: unknown; cwd?: unknown }; events?: unknown[] }
+          try {
+            snapshot = await query.readSession(id)
+          } catch (err) {
+            sendJson(res, 404, { error: '读取会话失败：' + (err instanceof Error ? err.message : String(err)) })
+            return
+          }
+          const events = Array.isArray(snapshot.events) ? snapshot.events : []
+          const transcript = buildTranscript(events, { maxMessages: 300 })
+          const owner = ownerOfSession(id)
+          // 跨用户读取留审计痕迹（读他人会话是敏感操作）。
+          audit('sessionRead', who, id, { owner, messages: transcript.messages.length })
+          const header = snapshot.session
+          sendJson(res, 200, {
+            ok: true,
+            sessionId: id,
+            owner,
+            createdAt: header !== undefined && typeof header.createdAt === 'number' ? header.createdAt : null,
+            cwd: header !== undefined && typeof header.cwd === 'string' ? header.cwd : null,
+            live: state.owners.sessions.has(id),
+            transcript,
+          })
+          return
+        }
         // ============ TOTP（0.5.0：每人管理自己的令牌） ============
         case 'totpStatus': {
           sendJson(res, 200, { ok: true, totp: { enabled: me.totpEnabled === true, twoFactor: me.twoFactor === true, ignore: me.totpIgnore === true } })
@@ -2788,10 +3019,10 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
     }
 
     // ============ 管理员操作审计（0.4.0：JSONL） ============
-    // 追加写 dsh-ui-auth-audit.jsonl（fs 服务工作目录）：记录越权尝试与全部
+    // 追加写 dsh-ui-auth-groups-audit.jsonl（fs 服务工作目录）：记录越权尝试与全部
     // 成功的管理员操作（增删用户/重置密码/改角色/改密）。低频操作，串行队列
     // 防并发写竞态；写失败仅记日志，不中断业务。
-    const AUDIT_FILE = 'dsh-ui-auth-audit.jsonl'
+    const AUDIT_FILE = 'dsh-ui-auth-groups-audit.jsonl'
     let auditChain = Promise.resolve()
     function audit(action: string, actor: string | undefined, target: string | undefined, extra?: Record<string, unknown>): void {
       const entry = { t: new Date().toISOString(), actor, action, target, ...(extra !== undefined ? extra : {}) }
@@ -2804,7 +3035,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
           try { old = await fsSvc.readText(t) } catch (err) { /* 首次写入：文件不存在 */ }
           await fsSvc.writeText(t, old + JSON.stringify(entry) + '\n')
         } catch (err) {
-          console.error('[dsh-ui-auth] 审计写入失败: ' + String(err))
+          console.error('[dsh-ui-auth-groups] 审计写入失败: ' + String(err))
         }
       })
     }
@@ -2814,14 +3045,14 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
       try {
         const fsSvc: FsService | undefined = ctx.get('fs')
         if (fsSvc === undefined) return
-        fsSvc.resolve('dsh-ui-auth-init.log').then((t) => fsSvc.writeText(t, msg + '\n', undefined)).catch(() => {})
+        fsSvc.resolve('dsh-ui-auth-groups-init.log').then((t) => fsSvc.writeText(t, msg + '\n', undefined)).catch(() => {})
       } catch (err) { /* ignore */ }
     }
 
     async function bootstrap(): Promise<void> {
       if (state.users.size > 0) return
       if (store === null) {
-        console.log('[dsh-ui-auth] 检测到 credentials 服务缺失，用户数据仅保存在内存中，重启后将丢失')
+        console.log('[dsh-ui-auth-groups] 检测到 credentials 服务缺失，用户数据仅保存在内存中，重启后将丢失')
       }
       const username = 'admin'
       const password = randomPassword(16)
@@ -2829,15 +3060,15 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
       const now = Date.now()
       const ok = await storeCreate({ v: 1, username, role: 'admin', ...rec, displayName: '管理员', email: '', createdAt: now, updatedAt: now })
       if (!ok) {
-        console.error('[dsh-ui-auth] 引导创建管理员失败（用户名已存在？）')
+        console.error('[dsh-ui-auth-groups] 引导创建管理员失败（用户名已存在？）')
         return
       }
-      console.log('[dsh-ui-auth] ================================================')
-      console.log('[dsh-ui-auth] 首次启动：已创建管理员账号')
-      console.log('[dsh-ui-auth]   用户名: ' + username)
-      console.log('[dsh-ui-auth]   密码:   ' + password)
-      console.log('[dsh-ui-auth] 请立即登录并修改密码。')
-      console.log('[dsh-ui-auth] ================================================')
+      console.log('[dsh-ui-auth-groups] ================================================')
+      console.log('[dsh-ui-auth-groups] 首次启动：已创建管理员账号')
+      console.log('[dsh-ui-auth-groups]   用户名: ' + username)
+      console.log('[dsh-ui-auth-groups]   密码:   ' + password)
+      console.log('[dsh-ui-auth-groups] 请立即登录并修改密码。')
+      console.log('[dsh-ui-auth-groups] ================================================')
       try {
         const fsSvc: FsService | undefined = ctx.get('fs')
         if (fsSvc !== undefined) {
@@ -2849,12 +3080,12 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
             '',
             '请在登录后立即修改该密码，然后删除本文件。',
           ]
-          const target = await fsSvc.resolve('dsh-ui-auth-bootstrap.txt')
+          const target = await fsSvc.resolve('dsh-ui-auth-groups-bootstrap.txt')
           await fsSvc.writeText(target, lines.join('\n'))
-          console.log('[dsh-ui-auth] 初始账号已写入文件 dsh-ui-auth-bootstrap.txt（进程工作目录）')
+          console.log('[dsh-ui-auth-groups] 初始账号已写入文件 dsh-ui-auth-groups-bootstrap.txt（进程工作目录）')
         }
       } catch (err) {
-        console.error('[dsh-ui-auth] 写入初始账号文件失败: ' + String(err))
+        console.error('[dsh-ui-auth-groups] 写入初始账号文件失败: ' + String(err))
       }
     }
 
@@ -2871,6 +3102,8 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
         }
         await bootstrap()
         await loadSessions()
+        // 组表最后装载：即使失败也只是「无组关系」，不影响登录与其余隔离。
+        await groups.load()
         state.ready = true
       } catch (err: any) {
         trace('step=error: ' + String(err) + (err && err.stack ? '\n' + err.stack : ''))
@@ -2882,14 +3115,14 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
     initialized.catch((err) => {
       state.fatal = String(err)
       trace('step=fatal: ' + String(err))
-      console.error('[dsh-ui-auth] 初始化失败（保持 fail-closed，所有非登录请求返回 503）: ' + (err instanceof Error ? (err.stack || err.message) : String(err)))
+      console.error('[dsh-ui-auth-groups] 初始化失败（保持 fail-closed，所有非登录请求返回 503）: ' + (err instanceof Error ? (err.stack || err.message) : String(err)))
     })
 
     // ============ 网关：包装 node:http 服务器 ============
     const ws: WebServerService | undefined = ctx.get('webServer')
     const server: Server | undefined = ws !== undefined && ws.server !== undefined ? ws.server : undefined
     if (server === undefined) {
-      console.error('[dsh-ui-auth] webServer 不可用，认证网关未启用（当前环境可能不提供 HTTP 服务）')
+      console.error('[dsh-ui-auth-groups] webServer 不可用，认证网关未启用（当前环境可能不提供 HTTP 服务）')
       return
     }
 
@@ -2904,7 +3137,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
     // 并改为**明确拒绝**，而不是放行——宁可面板不可访问，也不能无门暴露。
     const hostAuthorizeIndex = ctx.get('connection')?.authorizeIndex
     if (typeof hostAuthorizeIndex !== 'function') {
-      console.error('[dsh-ui-auth] 不支持的 DSH 宿主：未提供 connection.authorizeIndex。'
+      console.error('[dsh-ui-auth-groups] 不支持的 DSH 宿主：未提供 connection.authorizeIndex。'
         + ' v0.7.0 起仅支持 DSH 0.2.0-rc.2 传输线（legacy 0.1.1-rc.2 支持已移除）。'
         + ' 认证网关已 fail-closed：面板将不可访问，请升级 DSH 后重启。')
       server.removeAllListeners('request')
@@ -2912,7 +3145,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
       const denyRequest = (_req: IncomingMessage, res: ServerResponse): void => {
         try {
           res.writeHead(503, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' })
-          res.end('dsh-ui-auth: 不支持的 DSH 版本（需要 0.2.0-rc.2 传输线）。认证网关已 fail-closed，面板不可访问。')
+          res.end('dsh-ui-auth-groups: 不支持的 DSH 版本（需要 0.2.0-rc.2 传输线）。认证网关已 fail-closed，面板不可访问。')
         } catch (err) { try { res.destroy() } catch (e) { /* ignore */ } }
       }
       const denyUpgrade = (_req: IncomingMessage, socket: Duplex): void => {
@@ -2925,7 +3158,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
         server.removeListener('upgrade', denyUpgrade)
         for (const fn of origReq) server.on('request', fn)
         for (const fn of origUp) server.on('upgrade', fn)
-      }, 'dsh-ui-auth: 不支持宿主时的 fail-closed 监听器')
+      }, 'dsh-ui-auth-groups: 不支持宿主时的 fail-closed 监听器')
       return
     }
 
@@ -2957,6 +3190,9 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
           },
           claimSession: setSessionOwner,
           claimWorkspace: setWorkspaceOwner,
+          // 组可见性（读）：同组即可读彼此的会话与工作区。
+          // 写谓词在策略层独立实现（仅归属人本人），不受此回调影响。
+          sharesGroup: (viewer: string, owner: string) => groups.shares(viewer, owner),
           // R2：普通用户可见的模型 = 自有配置 + 收到的分享。管理员由策略层直接绕过。
           // 从未配置任何模型的用户得到空授权（目录为空、切换模型被拒）——这就是 Q2 的"阻断使用"。
           // 这里只读元数据（provider/model），不需要解锁，也不接触任何 Key。
@@ -3040,7 +3276,7 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
 
     const gate = (req: IncomingMessage, res: ServerResponse): void => {
       handleGate(req, res).catch((err) => {
-        console.error('[dsh-ui-auth] 网关处理异常: ' + (err instanceof Error ? (err.stack || err.message) : String(err)))
+        console.error('[dsh-ui-auth-groups] 网关处理异常: ' + (err instanceof Error ? (err.stack || err.message) : String(err)))
         if (res.headersSent) { try { res.destroy() } catch (e) { /* ignore */ } return }
         try { res.writeHead(500); res.end() } catch (e) { try { res.destroy() } catch (x) { /* ignore */ } }
       })
@@ -3081,14 +3317,14 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
         path: '/auth',
         handler: (req: IncomingMessage, res: ServerResponse) => {
           void handleAuthPath(req, res, pathnameOf(req.url)).catch((err) => {
-            console.error('[dsh-ui-auth] /auth 路由异常: ' + (err instanceof Error ? err.stack || err.message : String(err)))
+            console.error('[dsh-ui-auth-groups] /auth 路由异常: ' + (err instanceof Error ? err.stack || err.message : String(err)))
             if (!res.headersSent) { try { res.writeHead(500); res.end() } catch (e) { try { res.destroy() } catch (x) { /* ignore */ } } }
           })
         },
-      }), 'dsh-ui-auth: 官方注册 /auth 路由')
+      }), 'dsh-ui-auth-groups: 官方注册 /auth 路由')
     } else {
       // 0.2.0 线必有 register；缺失说明宿主契约不符（启动前置已拦住大部分情况），此处 fail-closed 提示。
-      console.error('[dsh-ui-auth] webServer.register 不可用：/auth/* 无法注册为官方路由，请检查 DSH 版本（需 0.2.0-rc.2 线）')
+      console.error('[dsh-ui-auth-groups] webServer.register 不可用：/auth/* 无法注册为官方路由，请检查 DSH 版本（需 0.2.0-rc.2 线）')
     }
 
     ctx.effect(() => () => {
@@ -3096,7 +3332,10 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
       server.removeListener('upgrade', gateUp)
       for (const fn of origReq) server.on('request', fn)
       for (const fn of origUp) server.on('upgrade', fn)
-    }, 'dsh-ui-auth: 还原网关监听器')
+    }, 'dsh-ui-auth-groups: 还原网关监听器')
+
+    // 组表强制落盘（防抖窗口内退出时不能丢成员变更）。
+    ctx.effect(() => () => void groups.flush(), 'dsh-ui-auth-groups: 组表落盘')
 
     // 会话与失败计数清理
     const sweep = () => {
@@ -3115,5 +3354,5 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
     }
     const timer = setInterval(sweep, SESSION_SWEEP_MS)
     timer.unref?.()
-    ctx.effect(() => () => clearInterval(timer), 'dsh-ui-auth: session cleanup timer')
+    ctx.effect(() => () => clearInterval(timer), 'dsh-ui-auth-groups: session cleanup timer')
 }

@@ -118,9 +118,9 @@ async function readBody(req) {
  */
 function rpFor(req, force) {
   const host = req.headers.host
-  if (!force) return resolveRelyingParty({ host, secure: false, rpName: 'dsh-ui-auth probe' })
+  if (!force) return resolveRelyingParty({ host, secure: false, rpName: 'dsh-ui-auth-groups probe' })
   const hostname = new URL(`http://${host}`).hostname.toLowerCase()
-  return { rpId: hostname, origin: `http://${host}`, rpName: 'dsh-ui-auth probe' }
+  return { rpId: hostname, origin: `http://${host}`, rpName: 'dsh-ui-auth-groups probe' }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -143,7 +143,7 @@ const server = http.createServer(async (req, res) => {
     return
   }
   if (req.method === 'GET' && url.pathname === '/rp') {
-    json(res, 200, assessRelyingParty({ host: req.headers.host, secure: false, rpName: 'dsh-ui-auth probe' }))
+    json(res, 200, assessRelyingParty({ host: req.headers.host, secure: false, rpName: 'dsh-ui-auth-groups probe' }))
     return
   }
   if (req.method !== 'POST') { json(res, 404, { ok: false, error: 'not found' }); return }
@@ -226,7 +226,7 @@ const clearResult = (page, key) => page.evaluate(k => { delete window.__results[
 
 async function probeHost(host) {
   const entry = { host, url: `http://${host}:${port}/` }
-  entry.assessment = assessRelyingParty({ host: `${host}:${port}`, secure: false, rpName: 'dsh-ui-auth probe' })
+  entry.assessment = assessRelyingParty({ host: `${host}:${port}`, secure: false, rpName: 'dsh-ui-auth-groups probe' })
   const page = await browser.newPage()
   const problems = []
   page.on('pageerror', error => problems.push(`pageerror: ${error.message}`))

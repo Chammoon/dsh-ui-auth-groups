@@ -174,7 +174,7 @@ const scriptMethod = await call('POST', '/auth/passkey/browser.js', '{}')
 check('通行密钥脚本仅允许 GET/HEAD → 405', scriptMethod.status === 405, `status=${scriptMethod.status}`)
 
 // ---- 7) register-success guide page: same inline-script contract, both factors advertised ----
-const bootstrap = fsFiles.get('dsh-ui-auth-bootstrap.txt') ?? ''
+const bootstrap = fsFiles.get('dsh-ui-auth-groups-bootstrap.txt') ?? ''
 const adminPassword = (/密码:\s+(\S+)/.exec(bootstrap) ?? [])[1]
 check('引导页用例：已取得一次性管理员口令', typeof adminPassword === 'string' && adminPassword !== '')
 

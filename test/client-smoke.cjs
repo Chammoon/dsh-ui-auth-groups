@@ -36,7 +36,7 @@ const exp = reg.factory((spec) => {
   throw new Error('require("' + spec + '") missed the module table')
 })
 
-if (exp.name !== 'dsh-ui-auth' || typeof exp.apply !== 'function') {
+if (exp.name !== 'dsh-ui-auth-groups' || typeof exp.apply !== 'function') {
   console.error('FAIL: bundle did not export the cordis plugin face')
   process.exit(1)
 }
@@ -112,7 +112,7 @@ const tick = () => new Promise((r) => setTimeout(r, 20))
   }
 
   // ---- 静态断言 ----
-  check('nav-hide hack removed (0.2.0 settings-shell owns the nav)', !code.includes('dsh-ui-auth-navhide') && !code.includes('nth-child(2)'))
+  check('nav-hide hack removed (0.2.0 settings-shell owns the nav)', !code.includes('dsh-ui-auth-groups-navhide') && !code.includes('nth-child(2)'))
   check('button color uses on-primary token', code.includes('--dsw-alias-label-primary-foreground'))
   check('button no longer uses contrast-fill', !code.includes('--dsw-alias-button-contrast-fill'))
   check('danger button uses on-primary token', /\.dshua button\.danger\{[^}]*--dsw-alias-label-primary-foreground/.test(code))
