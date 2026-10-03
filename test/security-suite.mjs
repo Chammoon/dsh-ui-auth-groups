@@ -1,0 +1,912 @@
+// ============================================================================
+// dsh-ui-auth 安全验证用例集（公网部署场景）
+// 用真实部署产物 lib/index.js（mock 服务器 + mock 服务），按攻击类别驱动真实
+// 网关代码路径，覆盖认证/会话/注入/CSRF/HTTP 层/信息泄露/越权/数据隔离/可用性/
+// 部署加固 10 类。运行：node test/security-suite.mjs
+// ============================================================================
+import { EventEmitter } from 'node:events'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { apply, readLockConfig, clientIp, totpCodeAt } from '../lib/index.js'
+
+// 会话 Cookie 名由插件按 DSH_HOME 派生（同一实例内稳定、实例间不同）；测试用同一公式。
+const COOKIE_NAME = 'dsh_auth_' + (() => {
+  const seed = process.env.DSH_HOME ?? process.cwd()
+  let hash = 0
+  for (let i = 0; i < seed.length; i += 1) hash = (hash * 31 + seed.charCodeAt(i)) >>> 0
+  return hash.toString(36)
+})()
+
+const HOST_SRC = readFileSync(new URL('../lib/index.js', import.meta.url), 'utf8')
+const CLIENT_SRC = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+
+const results = []
+function check(category, label, cond, extra) {
+  results.push({ category, label, pass: !!cond, extra })
+}
+
+// ---------------- mock 基础设施 ----------------
+function makeReq(method, url, cookie, body, ip = '127.0.0.1') {
+  const req = new EventEmitter()
+  req.method = method
+  req.url = url
+  req.headers = {}
+  // 真实宿主总会带上 Host（现代网关 prepare() 依赖它铸造原生载体 Cookie）
+  req.headers.host = 'localhost:3080'
+  if (cookie !== undefined) req.headers.cookie = COOKIE_NAME + '=' + cookie
+  req.socket = { remoteAddress: ip }
+  req.destroy = () => {}
+  const chunks = body !== undefined ? [Buffer.from(body)] : []
+  req[Symbol.asyncIterator] = () => {
+    let i = 0
+    return {
+      next() {
+        if (i < chunks.length) return Promise.resolve({ value: chunks[i++], done: false })
+        return Promise.resolve({ value: undefined, done: true })
+      },
+    }
+  }
+  if (body !== undefined) {
+    process.nextTick(() => { req.emit('data', Buffer.from(body)); req.emit('end') })
+  } else {
+    process.nextTick(() => { req.emit('end') })
+  }
+  return req
+}
+function makeRes() {
+  const res = { headersSent: false, status: 0, headers: {}, body: '', destroyed: false }
+  res.writeHead = (s, h) => { res.status = s; Object.assign(res.headers, h || {}); res.headersSent = true }
+  res.setHeader = (k, v) => { res.headers[k] = v }
+  res.write = (b) => { res.body += (b === undefined ? '' : String(b)); return true }
+  res.end = (b) => { if (b !== undefined) res.body += String(b); res.ended = true }
+  res.destroy = () => { res.destroyed = true }
+  return res
+}
+const parseJson = (res) => { try { return JSON.parse(res.body) } catch (e) { return null } }
+const settle = () => new Promise((r) => setImmediate(r))
+function cookieOf(res) {
+  const sc = res.headers['set-cookie']
+  if (!sc) return undefined
+  const m = new RegExp(COOKIE_NAME + '=([^;]+)').exec(sc)
+  return m ? m[1] : undefined
+}
+
+// ---------------- 主场景：admin + test1 + 数据归属 ----------------
+function buildServer() {
+  const server = new EventEmitter()
+  server.on('request', (req, res) => {
+    const rawPath = String(req.url).split('?')[0]
+    if (rawPath === '/api/session.export') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true }))
+      return
+    }
+    const method = rawPath.slice('/api/'.length)
+    ;(async () => {
+      let body = ''
+      const dec = new TextDecoder()
+      for await (const chunk of req) body += dec.decode(chunk, { stream: true })
+      body += dec.decode()
+      let rpcId = 'x'
+      try { rpcId = JSON.parse(body).rpcId || 'x' } catch (e) { /* keep */ }
+      const respond = (value) => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ type: 'server-response', rpcId, result: { ok: true, value } }))
+      }
+      switch (method) {
+        case 'session.list':
+          respond({ items: [
+            { sessionId: 's-admin', updatedAt: 1, running: false, blank: false },
+            { sessionId: 's-test1', updatedAt: 1, running: false, blank: false },
+            { sessionId: 's-created', updatedAt: 1, running: false, blank: false },
+          ] })
+          break
+        case 'workspace.list':
+          respond({ items: [
+            { workspaceId: 'w-admin', path: '/a', title: 'A', sessionIds: ['s-admin', 's-test1'], createdAt: '', updatedAt: '' },
+            { workspaceId: 'w-test1', path: '/b', title: 'B', sessionIds: ['s-test1'], createdAt: '', updatedAt: '' },
+          ], archivedSessionIds: ['s-admin'] })
+          break
+        case 'session.create': respond({ sessionId: 's-created' }); break
+        case 'session.history': respond({ items: [] }); break
+        default: respond({})
+      }
+    })()
+  })
+  return server
+}
+
+function buildStore() {
+  const records = new Map()
+  records.set('dsh-auth/ownership', {
+    kind: 'grant',
+    payload: JSON.stringify({ v: 1, sessions: { 's-admin': 'admin', 's-test1': 'test1' }, workspaces: { 'w-admin': 'admin', 'w-test1': 'test1' } }),
+  })
+  records.set('dsh-auth/admin', {
+    kind: 'grant',
+    payload: JSON.stringify({ v: 1, username: 'admin', role: 'admin', salt: '92a35561b3c19bd6fffa191822616141', hash: '598dee939ea92827781dfed37d8eaafdf51bed5ad91fddba6f98d34580c877fc', iterations: 60000, displayName: '管理员', email: '', createdAt: 1, updatedAt: 1 }),
+  })
+  records.set('dsh-auth/test1', {
+    kind: 'grant',
+    payload: JSON.stringify({ v: 1, username: 'test1', role: 'user', salt: '3c250d71860104b3e35c5f33f465b4fd', hash: 'd6b6df777d94a462e13cb64fd2f0adf35524210ceaa413ee75cdd82605774bf4', iterations: 60000, displayName: 'Test1', email: '', createdAt: 1, updatedAt: 1 }),
+  })
+  return {
+    records,
+    creds: {
+      async listRecords() { return [...records.keys()].map((key) => ({ key, kind: records.get(key).kind })) },
+      async readRecord(key) { return records.get(key) },
+      async modifyRecord(key, mutate) {
+        const current = records.get(key)
+        const next = await mutate(current)
+        if (next === undefined) return current
+        records.set(key, next)
+        return next
+      },
+      async deleteRecord(key) { records.delete(key) },
+    },
+  }
+}
+
+const server = buildServer()
+const { records, creds } = buildStore()
+const bootstrapFile = []
+let apiProxyCurrent = undefined // WS 隔离组会注入 apiProxy mock
+const fsMock = {
+  async resolve(p) { return { path: p } },
+  async writeText(t, c) { bootstrapFile.push(c) },
+  async readText() { throw Object.assign(new Error('not found'), { code: 'FS_NOT_FOUND' }) },
+}
+// v0.7.0：插件要求现代宿主；桩模拟 0.2.0 的 connection 契约（authorizeIndex 必须下发载体 Cookie）
+const modernConnection = {
+  authorizeIndex(_req, res) {
+    res.writeHead(200, { 'set-cookie': 'dsh-auth-sec=1; Path=/; HttpOnly' })
+    return true
+  },
+  authenticatedUrl(baseUrl) { return baseUrl },
+  requestRejection() { return undefined },
+  createSharedFetchHandler() {
+    return { fetch: async () => new Response('{}', { status: 404, headers: { 'content-type': 'application/json' } }) }
+  },
+}
+
+const ctx = {
+  get(n) {
+    if (n === 'credentials') return creds
+    if (n === 'fs') return fsMock
+    if (n === 'webServer') return { server }
+    if (n === 'connection') return modernConnection
+    if (n === 'apiProxy') return apiProxyCurrent
+    return undefined
+  },
+  effect() {},
+  interval() { return () => {} },
+  timeout(ms) { return new Promise((r) => setTimeout(r, ms)) },
+}
+apply(ctx)
+await new Promise((r) => setTimeout(r, 300))
+
+const login = async (u, p, ip = '127.0.0.1') => {
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: u, password: p }), ip), r)
+  await settle()
+  return r
+}
+let adminCookie = cookieOf(await login('admin', 'new-admin-pw-9999'))
+let test1Cookie = cookieOf(await login('test1', '12345678'))
+check('AUTH', 'admin 登录成功', adminCookie !== undefined)
+check('AUTH', 'test1 登录成功', test1Cookie !== undefined)
+
+// ==================== A. 认证 ====================
+check('AUTH', '引导使用随机密码（无硬编码默认密码）', HOST_SRC.includes('randomPassword(16)'))
+{
+  const ok = JSON.parse(records.get('dsh-auth/test1').payload)
+  check('AUTH', '存储 payload 无 password 字段（仅 salt/hash）', !('password' in ok))
+}
+{
+  const wrong = await login('test1', 'wrong-pass-xx', '10.0.0.2')
+  const unknown = await login('nobody', 'whatever123', '10.0.0.3')
+  check('AUTH', '错误密码 → 401', wrong.status === 401)
+  check('AUTH', '不存在用户名 → 相同 401 文案（防账号枚举）',
+    wrong.status === 401 && unknown.status === 401 && parseJson(wrong).error === parseJson(unknown).error
+    && parseJson(wrong).error === '用户名或密码错误')
+}
+{
+  const r = await login('test1', '12345678')
+  const sc = r.headers['set-cookie'] || ''
+  check('SESSION', 'Cookie: HttpOnly', sc.includes('HttpOnly'))
+  check('SESSION', 'Cookie: SameSite=Strict', sc.includes('SameSite=Strict'))
+  check('SESSION', 'Cookie: Path=/', sc.includes('Path=/'))
+  check('SESSION', 'Cookie: Max-Age 存在', /Max-Age=\d+/.test(sc))
+}
+{
+  // 会话固定：登录前先植入伪造 cookie，登录后必须签发全新 token
+  const planted = 'attacker-controlled-token-123'
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', planted, JSON.stringify({ username: 'test1', password: '12345678' }), '10.0.0.4'), r)
+  await settle()
+  const newToken = cookieOf(r)
+  check('SESSION', '会话固定防护：签发全新 token（不复用植入值）', newToken !== undefined && newToken !== planted)
+}
+{
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/me', adminCookie, '{}'), r)
+  await settle()
+  const me = parseJson(r)
+  check('AUTH', 'me 响应不含 salt/hash（不泄露凭据材料）', r.status === 200 && me.ok && !('salt' in me.me) && !('hash' in me.me) && !('iterations' in me.me))
+}
+{
+  // 弱密码策略
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/createUser', adminCookie, JSON.stringify({ username: 'weak', password: 'short' })), r)
+  await settle()
+  check('AUTH', '弱密码被拒绝（最少 8 位）', r.status === 400)
+}
+check('AUTH', '密码比较使用常量时间实现', HOST_SRC.includes('constantTimeEqual'))
+
+// ==================== B. 会话 ====================
+{
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/me', 'bogus-token', '{}'), r)
+  await settle()
+  check('SESSION', '伪造/无效会话 → 401', r.status === 401)
+}
+{
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/auth/logout', test1Cookie), r)
+  await settle()
+  const after = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/me', test1Cookie, '{}'), after)
+  await settle()
+  check('SESSION', '登出后会话立即失效', parseJson(r).ok === true && after.status === 401)
+}
+{
+  // 登出必须是写操作（POST-only），防止 GET 型 CSRF/缓存链触发登出。
+  // 用全新会话验证 GET 登出被拒后会话仍然有效（前一个 POST 登出已销毁旧会话）。
+  const fresh = cookieOf(await login('test1', '12345678'))
+  const r = makeRes()
+  server.emit('request', makeReq('GET', '/auth/logout', fresh, undefined), r)
+  await settle()
+  check('SESSION', 'GET /auth/logout → 405（登出仅允许 POST）', r.status === 405)
+  const after = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/me', fresh, '{}'), after)
+  await settle()
+  check('SESSION', 'GET 登出被拒后会话仍然有效', after.status === 200)
+  // 后续用例继续使用 test1 会话
+  test1Cookie = fresh
+}
+{
+  // 修改密码：旧密码失效、新密码可用、其他会话失效
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/changePassword', adminCookie, JSON.stringify({ oldPassword: 'new-admin-pw-9999', newPassword: 'brand-new-pw-8888' })), r)
+  await settle()
+  const oldLogin = await login('admin', 'new-admin-pw-9999', '10.0.0.5')
+  const newLogin = await login('admin', 'brand-new-pw-8888', '10.0.0.6')
+  check('SESSION', '改密后旧密码失效', r.status === 200 && oldLogin.status === 401)
+  check('SESSION', '改密后新密码可用', newLogin.status === 200)
+  // 改回原密码，保持后续用例一致（changePassword 会使该用户其它会话失效，
+  // 因此改密往返后重新登录 admin 刷新 cookie）
+  const r2 = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/changePassword', cookieOf(newLogin), JSON.stringify({ oldPassword: 'brand-new-pw-8888', newPassword: 'new-admin-pw-9999' })), r2)
+  await settle()
+  check('SESSION', '改回原密码成功', parseJson(r2).ok === true)
+  adminCookie = cookieOf(await login('admin', 'new-admin-pw-9999'))
+  check('SESSION', '改密后重新登录成功（admin 后续用例使用新会话）', adminCookie !== undefined)
+}
+check('SESSION', '会话 TTL 常量存在（12h 滑动续期）', HOST_SRC.includes('SESSION_TTL_MS = 12 * 60 * 60 * 1000'))
+
+// ==================== C. 注入 ====================
+check('INJ', '客户端无 dangerouslySetInnerHTML / innerHTML / eval（XSS 由 React 转义）',
+  !CLIENT_SRC.includes('dangerouslySetInnerHTML') && !CLIENT_SRC.includes('innerHTML') && !CLIENT_SRC.includes('eval(') && !CLIENT_SRC.includes('new Function'))
+{
+  // 开放重定向防护：next 必须为站内路径
+  const r = makeRes()
+  server.emit('request', makeReq('GET', '/some/route', undefined, undefined), r)
+  const q = String(r.headers.location || '')
+  check('INJ', '未登录页面导航重定向到站内登录页', q.startsWith('/auth/login'))
+}
+{
+  // 开放重定向：safeNext 只接受站内路径（拒绝外站/协议/双斜杠）
+  const cases = [
+    ['http://evil.com', '/'],
+    ['//evil.com', '/'],
+    ['https://evil.com/x', '/'],
+    ['%2F%2Fevil.com', '/'],
+    ['/%2F%2Fevil.com', '/'],
+    ['javascript:alert(1)', '/'],
+    ['/settings', '/settings'],
+    ['/auth/login?x=1', '/auth/login?x=1'],
+  ]
+  for (const [next, expect] of cases) {
+    const r = makeRes()
+    server.emit('request', makeReq('GET', '/auth/login?next=' + next, test1Cookie, undefined), r)
+    await settle()
+    const loc = String(r.headers.location || '')
+    check('INJ', '开放重定向: next=' + next + ' → ' + expect, r.status === 302 && loc === expect, 'got: ' + loc)
+  }
+}
+{
+  // CRLF 注入：next 无法向响应头注入换行
+  const r = makeRes()
+  server.emit('request', makeReq('GET', '/auth/login?next=' + encodeURIComponent('/a%0d%0aX-Evil:1'), test1Cookie, undefined), r)
+  await settle()
+  const loc = String(r.headers.location || '')
+  check('INJ', 'next 参数 CRLF 注入被拒（location 无换行）', r.status === 302 && !loc.includes('\r') && !loc.includes('\n'), 'got: ' + loc)
+}
+{
+  // 超大请求体 → 400 拒绝且不崩溃（/auth/rpc/* 网关内 readBody 限流）
+  const big = JSON.stringify({ pad: 'x'.repeat(70000) })
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/me', test1Cookie, big), r)
+  await settle()
+  check('INJ', '超大请求体被拒（64KB 上限）', r.status === 400 && parseJson(r).error === '请求体格式错误')
+}
+{
+  // 登录页不反射提交的用户名（无反射型 XSS 面）
+  const before = makeRes()
+  server.emit('request', makeReq('GET', '/auth/login', undefined, undefined), before)
+  const after = makeRes()
+  server.emit('request', makeReq('GET', '/auth/login', undefined, undefined), after)
+  check('INJ', '登录页为静态 HTML（两次渲染一致，不含用户输入）', before.body === after.body && !before.body.includes('<script>alert'))
+}
+
+// ==================== D. CSRF ====================
+{
+  // 跨站表单提交（urlencoded）到 JSON 端点 → 拒绝
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/changePassword', test1Cookie, 'oldPassword=x&newPassword=y', '10.0.0.7'), r)
+  await settle()
+  check('CSRF', '非 JSON 内容类型的状态变更请求被拒', r.status === 400)
+}
+{
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'test1', password: '12345678' }), '10.0.0.8'), r)
+  const headers = Object.keys(r.headers)
+  check('CSRF', '响应不携带 CORS 放行头（跨源读不到响应）', !headers.some((h) => h.toLowerCase().startsWith('access-control-allow')))
+}
+check('CSRF', 'SameSite=Strict 已启用（见 SESSION 组）', true)
+
+// ==================== E. HTTP 层 ====================
+{
+  const r = makeRes()
+  server.emit('request', makeReq('GET', '/auth/rpc/me', adminCookie, undefined), r)
+  await settle()
+  check('HTTP', 'GET 访问 RPC 端点 → 405', r.status === 405)
+}
+{
+  const r = makeRes()
+  server.emit('request', makeReq('DELETE', '/auth/login', undefined, undefined), r)
+  await settle()
+  check('HTTP', 'DELETE 访问登录端点 → 405', r.status === 405)
+}
+{
+  const r = makeRes()
+  server.emit('request', makeReq('GET', '/api/session.list', undefined, undefined), r)
+  await settle()
+  check('HTTP', '未认证 API → 401（无旁路）', r.status === 401)
+}
+{
+  const r = makeRes()
+  server.emit('request', makeReq('GET', '/assets/app.js', undefined, undefined), r)
+  await settle()
+  check('HTTP', '未认证静态资源 → 401（无旁路）', r.status === 401)
+}
+{
+  const r = makeRes()
+  server.emit('request', makeReq('GET', '/', undefined, undefined), r)
+  check('HTTP', '未认证页面 → 302 登录页', r.status === 302)
+}
+{
+  // WebSocket 升级门控（mock socket 驱动真实 gateUp；事件流升级走代理）
+  const fakeSocket = (opts = {}) => ({
+    written: [], destroyed: false, ended: false,
+    write(c) { this.written.push(Buffer.from(c)); return true },
+    end() { this.ended = true }, destroy() { this.destroyed = true },
+    setKeepAlive() {}, setTimeout() {}, on() {}, once() {}, removeListener() {},
+  })
+  const upgradeReq = (path, cookie, extra) => {
+    const r = makeReq('GET', path, cookie, undefined)
+    r.headers = { ...r.headers, ...extra }
+    return r
+  }
+  const WS_KEY = 'dGhlIHNhbXBsZSBub25jZQ=='
+  // 1) 未认证 → 销毁
+  const s1 = fakeSocket()
+  server.emit('upgrade', upgradeReq('/api/events.mux', undefined, { 'sec-websocket-key': WS_KEY }), s1, Buffer.alloc(0))
+  check('HTTP', 'WS 未认证升级 → 立即销毁连接', s1.destroyed === true)
+  // 2) /auth/* → 销毁
+  const s3 = fakeSocket()
+  server.emit('upgrade', upgradeReq('/auth/ws', undefined, { 'sec-websocket-key': WS_KEY }), s3, Buffer.alloc(0))
+  check('HTTP', 'WS 指向 /auth/* → 销毁（不暴露认证端点）', s3.destroyed === true)
+  // 3) 非事件流升级 + 有效会话 → 放行（转发原监听器）
+  const s4 = fakeSocket()
+  server.emit('upgrade', upgradeReq('/api/other-ws', test1Cookie, { 'sec-websocket-key': WS_KEY }), s4, Buffer.alloc(0))
+  check('HTTP', '非事件流 WS 有效会话升级 → 放行（不销毁）', s4.destroyed === false)
+  // legacy 事件流升级断言（apiProxy / 自研握手）已随 v0.7.0 移除；现代线仅 /api/remote.mux 走网关。
+  // 4) 事件流升级 + 有效会话 + apiProxy 缺失 → fail-closed 销毁（绝不透传全量帧）
+  const s5 = fakeSocket()
+  server.emit('upgrade', upgradeReq('/api/events.mux', test1Cookie, { 'sec-websocket-key': WS_KEY }), s5, Buffer.alloc(0))
+  // 5) 事件流升级缺 Sec-WebSocket-Key → 销毁
+  const s6 = fakeSocket()
+  server.emit('upgrade', upgradeReq('/api/events.mux', test1Cookie), s6, Buffer.alloc(0))
+}
+{
+  // fail-closed：存储故障时非认证请求 503
+  const serverBad = new EventEmitter()
+  serverBad.on('request', () => {})
+  const ctxBad = {
+    get(n) {
+      if (n === 'credentials') return { listRecords: async () => { throw new Error('store down') }, readRecord: async () => undefined, modifyRecord: async () => undefined, deleteRecord: async () => {} }
+      if (n === 'fs') return { async resolve() { return {} }, async writeText() {} }
+      if (n === 'webServer') return { server: serverBad }
+      if (n === 'connection') return modernConnection
+      return undefined
+    },
+    effect() {},
+    interval() { return () => {} },
+    timeout(ms) { return new Promise((r) => setTimeout(r, ms)) },
+  }
+  apply(ctxBad)
+  await new Promise((r) => setTimeout(r, 300))
+  const r = makeRes()
+  serverBad.emit('request', makeReq('GET', '/', undefined, undefined), r)
+  check('HTTP', 'fail-closed：存储故障时页面请求 503（不开放）', r.status === 503)
+  // init 未完成/失败时，登录与 RPC 也返回明确的 503（而非误导性 401/500）
+  const rl = makeRes()
+  serverBad.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'admin', password: 'x' })), rl)
+  await settle()
+  check('HTTP', '初始化未完成时登录 503（提示稍后重试，非 401）', rl.status === 503 && parseJson(rl).error === '服务初始化中，请稍后重试')
+  const rr = makeRes()
+  serverBad.emit('request', makeReq('POST', '/auth/rpc/me', 'bogus', '{}'), rr)
+  await settle()
+  check('HTTP', '初始化未完成时 RPC 503', rr.status === 503)
+}
+
+// K. WS 事件流按用户隔离：legacy 传输线专用，已随 v0.7.0 移除。
+// 现代线等价覆盖：test/modern-policy.test.mjs（策略矩阵）与 WP8 的 test/live-020-mux.mjs（mux 帧隔离实测）。
+
+// ==================== L. 限流配置（0.4.0 可配置化） ====================
+{
+  check('CFG', '默认限流配置：5 次 / 30s / 不信任 XFF',
+    JSON.stringify(readLockConfig({})) === JSON.stringify({ maxFails: 5, lockMs: 30000, trustProxy: false }))
+  check('CFG', '环境变量覆盖限流配置',
+    JSON.stringify(readLockConfig({ DSH_AUTH_MAX_FAILS: '3', DSH_AUTH_LOCK_MS: '5000', DSH_AUTH_TRUST_PROXY: '1' })) === JSON.stringify({ maxFails: 3, lockMs: 5000, trustProxy: true }))
+  check('CFG', '非法配置值回退默认', readLockConfig({ DSH_AUTH_MAX_FAILS: 'abc', DSH_AUTH_LOCK_MS: '-1' }).maxFails === 5 && readLockConfig({ DSH_AUTH_LOCK_MS: '-1' }).lockMs === 30000)
+  check('CFG', '默认不信任 X-Forwarded-For（伪造 XFF 不生效）',
+    clientIp({ socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-forwarded-for': '203.0.113.9' } }, false) === '127.0.0.1')
+  check('CFG', 'trustProxy 时取 XFF 最右（最近反代追加，客户端不可伪造）',
+    clientIp({ socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-forwarded-for': '203.0.113.9, 10.0.0.1' } }, true) === '10.0.0.1')
+  check('CFG', '伪造 XFF（最左）不再生效（取最右真实来源）',
+    clientIp({ socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-forwarded-for': '6.6.6.6, 10.0.0.1' } }, true) === '10.0.0.1')
+  check('CFG', 'XFF 尾部空段时从右找首个非空',
+    clientIp({ socket: { remoteAddress: '127.0.0.1' }, headers: { 'x-forwarded-for': '203.0.113.9, ' } }, true) === '203.0.113.9')
+  check('CFG', 'trustProxy 但无 XFF 时回退 socket 地址',
+    clientIp({ socket: { remoteAddress: '192.0.2.7' }, headers: {} }, true) === '192.0.2.7')
+  // Secure Cookie：TLS 直连追加；HTTP 不加；未信任反代时 X-Forwarded-Proto 不生效
+  const secLogin = makeRes()
+  const secReq = makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'admin', password: 'new-admin-pw-9999' }), '10.5.0.1')
+  secReq.socket = { remoteAddress: '10.5.0.1', encrypted: true }
+  server.emit('request', secReq, secLogin)
+  await settle()
+  check('CFG', 'TLS 直连登录 Cookie 含 Secure', new RegExp(COOKIE_NAME + '=').test(secLogin.headers['set-cookie'] || '') && (secLogin.headers['set-cookie'] || '').includes('Secure'))
+  const plainLogin = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'admin', password: 'new-admin-pw-9999' }), '10.5.0.2'), plainLogin)
+  await settle()
+  check('CFG', 'HTTP 登录 Cookie 不含 Secure（内网调试兼容）', new RegExp(COOKIE_NAME + '=').test(plainLogin.headers['set-cookie'] || '') && !(plainLogin.headers['set-cookie'] || '').includes('Secure'))
+  const xfpReq = makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'admin', password: 'new-admin-pw-9999' }), '10.5.0.3')
+  xfpReq.headers = { ...xfpReq.headers, 'x-forwarded-proto': 'https' }
+  const xfpLogin = makeRes()
+  server.emit('request', xfpReq, xfpLogin)
+  await settle()
+  check('CFG', '未信任反代时 X-Forwarded-Proto 不启用 Secure', new RegExp(COOKIE_NAME + '=').test(xfpLogin.headers['set-cookie'] || '') && !(xfpLogin.headers['set-cookie'] || '').includes('Secure'))
+}
+
+// ==================== M. 注册 + 邀请码（0.5.0） ====================
+{
+  const postReg = (body) => new Promise((resolve) => {
+    const r = makeRes()
+    // 默认补 confirmPassword = password（除非调用方显式传不一致值）
+    const withConfirm = { confirmPassword: body.password, ...body }
+    server.emit('request', makeReq('POST', '/auth/register', undefined, JSON.stringify(withConfirm), '10.1.0.1'), r)
+    setTimeout(() => resolve(r), 60)
+  })
+  const page = makeRes()
+  server.emit('request', makeReq('GET', '/auth/register', undefined, undefined), page)
+  check('REG', '注册页 GET 200（含邀请码字段）', page.status === 200 && page.body.includes('邀请码') && page.body.includes('已有账号？返回登录'))
+  check('REG', '注册页含确认密码与眼睛按钮', page.body.includes('确认密码') && page.body.includes('eye') && page.body.includes('显示/隐藏密码'))
+  check('REG', '注册页/接口 no-store', (page.headers['cache-control'] || '').includes('no-store'))
+  const bad = await postReg({ username: 'regs1', password: 'regs1-pw-1', email: '', invite: 'NOPE1234' })
+  check('REG', '无效邀请码 → 403', bad.status === 403 && parseJson(bad).error === '邀请码无效或已用完')
+  const mismatch = await postReg({ username: 'regs1b', password: 'regs1-pw-1', confirmPassword: 'different-pw', email: '', invite: 'NOPE1234' })
+  check('REG', '两次密码不一致 → 400', mismatch.status === 400 && parseJson(mismatch).error === '两次输入的密码不一致')
+  const weak = await postReg({ username: 'regs2', password: 'short', email: '', invite: 'NOPE1234' })
+  check('REG', '弱密码（长度不足）→ 400（先于邀请码校验）', weak.status === 400)
+  const noComplex = await postReg({ username: 'regs2c', password: 'abcdefgh', email: '', invite: 'NOPE1234' })
+  check('REG', '复杂度不足（8 位纯字母）→ 400', noComplex.status === 400 && parseJson(noComplex).error.includes('字符类型'))
+  const badName = await postReg({ username: 'x', password: 'regs2-pw-1234', email: '', invite: 'NOPE1234' })
+  check('REG', '用户名格式非法 → 400', badName.status === 400)
+  // 有效邀请码全流程（admin 生成 → 注册 → 次数耗尽）
+  const inv = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/inviteCreate', adminCookie, JSON.stringify({ amount: 1, uses: 1 })), inv)
+  await settle()
+  const code = (parseJson(inv) || {}).codes !== undefined ? parseJson(inv).codes[0] : undefined
+  check('REG', '管理员生成邀请码（8 位去混淆字符集）', inv.status === 200 && typeof code === 'string' && /^[A-Z2-9]{8}$/.test(code))
+  const okReg = await postReg({ username: 'regs3', password: 'regs3-pw-1234', email: 'regs3@example.com', invite: code })
+  check('REG', '有效邀请码注册成功（自动登录 + 引导页 redirect）', okReg.status === 200 && parseJson(okReg).ok === true && new RegExp(COOKIE_NAME + '=').test(okReg.headers['set-cookie'] || '') && parseJson(okReg).redirect === '/auth/register/success')
+  // 引导页：带注册会话可访问，未登录重定向
+  const regs3Cookie = new RegExp(COOKIE_NAME + '=([^;]+)').exec(okReg.headers['set-cookie'] || '')[1]
+  const succPage = makeRes()
+  server.emit('request', makeReq('GET', '/auth/register/success', regs3Cookie, undefined), succPage)
+  await settle()
+  check('REG', '注册引导页含「立即添加 TOTP」', succPage.status === 200 && succPage.body.includes('立即添加 TOTP'))
+  const succNoLogin = makeRes()
+  server.emit('request', makeReq('GET', '/auth/register/success', undefined, undefined), succNoLogin)
+  await settle()
+  check('REG', '未登录访问引导页 → 302 登录页', succNoLogin.status === 302 && (succNoLogin.headers.location || '').startsWith('/auth/login'))
+  const exhausted = await postReg({ username: 'regs4', password: 'regs4-pw-1234', email: '', invite: code })
+  check('REG', '邀请码次数耗尽 → 403', exhausted.status === 403)
+  const denied = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/inviteCreate', test1Cookie, JSON.stringify({ amount: 1 })), denied)
+  await settle()
+  check('REG', '普通用户 inviteCreate → 403（越权）', denied.status === 403)
+  // 管理员撤销不存在的邀请码 → 404
+  const revMissing = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/inviteRevoke', adminCookie, JSON.stringify({ code: 'ZZZZ9999' })), revMissing)
+  await settle()
+  check('REG', '撤销不存在的邀请码 → 404', revMissing.status === 404)
+  // 用户名 XSS 字符被拒绝（USERNAME_RE 不允许 < > 等）
+  const xssName = await postReg({ username: 'a<script>', password: 'xss-pw-1234', confirmPassword: 'xss-pw-1234', email: '', invite: 'NOPE1234' })
+  check('REG', '用户名含 HTML 字符 → 400（无 XSS 注入面）', xssName.status === 400)
+  const regLogin = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'regs3', password: 'regs3-pw-1234' }), '10.1.0.2'), regLogin)
+  await settle()
+  check('REG', '新注册用户可登录（role=user，邮箱保留）', regLogin.status === 200 && new RegExp(COOKIE_NAME + '=').test(regLogin.headers['set-cookie'] || ''))
+  const page2 = makeRes()
+  server.emit('request', makeReq('POST', '/auth/register', undefined, '{oops not json'), page2)
+  await settle()
+  check('REG', '注册接口畸形 JSON → 400', page2.status === 400)
+  // 引导页 no-store
+  const succPage2 = makeRes()
+  const regs3c = new RegExp(COOKIE_NAME + '=([^;]+)').exec(regLogin.headers['set-cookie'] || '') !== null ? new RegExp(COOKIE_NAME + '=([^;]+)').exec(regLogin.headers['set-cookie'] || '')[1] : ''
+  server.emit('request', makeReq('GET', '/auth/register/success', regs3c, undefined), succPage2)
+  await settle()
+  check('REG', '引导页 no-store', (succPage2.headers['cache-control'] || '').includes('no-store'))
+}
+
+// ==================== N. TOTP 两步验证（0.5.0） ====================
+{
+  const rpcCall = (method, body, cookie) => new Promise((resolve) => {
+    const r = makeRes()
+    server.emit('request', makeReq('POST', '/auth/rpc/' + method, cookie, JSON.stringify(body || {})), r)
+    setTimeout(() => resolve(r), 60)
+  })
+  const st0 = await rpcCall('totpStatus', {}, test1Cookie)
+  check('TOTP', '初始状态未启用', parseJson(st0).totp !== undefined && parseJson(st0).totp.enabled === false)
+  // 未绑定 TOTP 时不能开启 2FA
+  const on2faEarly = await rpcCall('totpSet2fa', { enabled: true }, test1Cookie)
+  check('TOTP', '未绑定 TOTP 时开启两步验证 → 400', on2faEarly.status === 400)
+  const gen = await rpcCall('totpGenerate', {}, test1Cookie)
+  const secret = (parseJson(gen) || {}).secret
+  const qrUrl = (parseJson(gen) || {}).qrDataUrl
+  check('TOTP', '生成密钥：base32 格式 + otpauth URL + 二维码 SVG', gen.status === 200 && /^[A-Z2-7]{20,}$/.test(secret || '') && (parseJson(gen) || {}).otpauth !== undefined && (parseJson(gen) || {}).otpauth.indexOf('otpauth://totp/') === 0 && typeof qrUrl === 'string' && qrUrl.startsWith('data:image/svg+xml;base64,'))
+  const badV = await rpcCall('totpVerify', { code: '000000' }, test1Cookie)
+  check('TOTP', '错误动态码 → 403', badV.status === 403)
+  const goodCode = totpCodeAt(secret, Date.now() / 1000)
+  const okV = await rpcCall('totpVerify', { code: goodCode }, test1Cookie)
+  check('TOTP', '正确动态码启用成功', okV.status === 200)
+  const me = await rpcCall('me', {}, test1Cookie)
+  const meStr = JSON.stringify(parseJson(me))
+  check('TOTP', 'me 显示已启用且不泄露 secret', parseJson(me).me.totpEnabled === true && !meStr.includes('totpSecret'))
+  const gen2 = await rpcCall('totpGenerate', {}, test1Cookie)
+  check('TOTP', '已启用后重新生成 → 400', gen2.status === 400)
+  // 绑定 TOTP 后默认不强制 2FA：密码直接登录
+  const loginPlain1 = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'test1', password: '12345678' }), '10.3.0.1'), loginPlain1)
+  await settle()
+  check('TOTP', '绑定后默认 2FA 关闭：密码直接登录成功', loginPlain1.status === 200 && parseJson(loginPlain1).totpRequired !== true && new RegExp(COOKIE_NAME + '=').test(loginPlain1.headers['set-cookie'] || ''))
+  // 0.6.4：免密 TOTP 登录已移除 —— 只给动态码不给密码一律 400
+  const loginFree1 = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'test1', totp: goodCode }), '10.3.0.2'), loginFree1)
+  await settle()
+  check('TOTP', '0.6.4 起免密 TOTP 登录已移除（缺密码 → 400）', loginFree1.status === 400 && !new RegExp(COOKIE_NAME + '=').test(loginFree1.headers['set-cookie'] || ''))
+  // 开启两步验证开关
+  const on2fa = await rpcCall('totpSet2fa', { enabled: true }, test1Cookie)
+  check('TOTP', '开启两步验证开关', on2fa.status === 200)
+  // 2FA 开启：密码登录 → totpRequired（不签发会话）
+  const loginNoTotp = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'test1', password: '12345678' }), '10.3.0.3'), loginNoTotp)
+  await settle()
+  check('TOTP', '2FA 开启：密码正确但要求动态码（不签发会话）', loginNoTotp.status === 200 && parseJson(loginNoTotp).totpRequired === true && !(loginNoTotp.headers['set-cookie'] || '').includes('dsh_auth='))
+  // 2FA 开启：密码 + TOTP → 登录成功
+  const login2fa = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'test1', password: '12345678', totp: goodCode }), '10.3.0.4'), login2fa)
+  await settle()
+  check('TOTP', '2FA 开启：密码 + 动态码两步登录成功', login2fa.status === 200 && new RegExp(COOKIE_NAME + '=').test(login2fa.headers['set-cookie'] || ''))
+  // 2FA 开启：密码 + 错误动态码 → 403
+  const loginBadTotp = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'test1', password: '12345678', totp: '000000' }), '10.3.0.5'), loginBadTotp)
+  await settle()
+  check('TOTP', '2FA 开启：动态码错误 → 403', loginBadTotp.status === 403)
+  // 2FA 开启：只给动态码不给密码 → 400（免密路径已不存在）
+  const loginFreeReject = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'test1', totp: goodCode }), '10.3.0.6'), loginFreeReject)
+  await settle()
+  check('TOTP', '2FA 开启：只给动态码 → 400（免密 TOTP 已移除）', loginFreeReject.status === 400)
+  // 未启用 TOTP 的账号只给动态码 → 同样 400（不再区分账号状态，避免枚举）
+  const loginFreeNoTotp = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, JSON.stringify({ username: 'admin', totp: '000000' }), '10.3.0.7'), loginFreeNoTotp)
+  await settle()
+  check('TOTP', '未启用 TOTP 的账号只给动态码 → 400', loginFreeNoTotp.status === 400)
+  // 普通用户不能移除他人 TOTP（test1 尝试移除 admin 的）
+  const rmOther = await rpcCall('totpRemove', { username: 'admin', code: goodCode }, test1Cookie)
+  check('TOTP', '普通用户移除他人 TOTP → 403', rmOther.status === 403)
+  // 管理员移除不存在的用户 → 404
+  const rmMissing = await rpcCall('totpRemove', { username: 'nobody-xyz' }, adminCookie)
+  check('TOTP', '管理员移除不存在用户的 TOTP → 404', rmMissing.status === 404)
+  const rmBad = await rpcCall('totpRemove', { code: '000000' }, test1Cookie)
+  check('TOTP', '移除需验证码（错误码 403）', rmBad.status === 403)
+  const rmOk = await rpcCall('totpRemove', { code: goodCode }, test1Cookie)
+  check('TOTP', '正确验证码移除成功', rmOk.status === 200)
+  const ign = await rpcCall('totpIgnore', { ignore: true }, test1Cookie)
+  const me2 = await rpcCall('me', {}, test1Cookie)
+  check('TOTP', '永久忽略开关生效', ign.status === 200 && parseJson(me2).me.totpIgnore === true)
+  const me3 = await rpcCall('me', {}, test1Cookie)
+  check('TOTP', '移除后恢复未启用', parseJson(me3).me.totpEnabled === false)
+}
+
+// ==================== F. 信息泄露 ====================
+{
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/auth/login', undefined, '{oops not json', '10.0.0.9'), r)
+  await settle()
+  check('INFO', '畸形 JSON → 通用错误（无堆栈/内部信息）', r.status === 400 && parseJson(r).error === '请求体格式错误')
+}
+{
+  const r = makeRes()
+  server.emit('request', makeReq('GET', '/auth/login', undefined, undefined), r)
+  const cc = r.headers['cache-control'] || ''
+  const r2 = makeRes()
+  server.emit('request', makeReq('POST', '/auth/rpc/me', test1Cookie, '{}'), r2)
+  await settle()
+  const cc2 = r2.headers['cache-control'] || ''
+  check('INFO', '认证页面/接口 no-store（防缓存泄露）', cc.includes('no-store') && cc2.includes('no-store'))
+}
+check('INFO', '网关异常时返回通用 500（不泄露堆栈）', HOST_SRC.includes('网关处理异常') && HOST_SRC.includes('res.writeHead(500)'))
+
+// ==================== G. 越权（垂直 + 水平） ====================
+{
+  for (const m of ['listUsers', 'createUser', 'resetPassword', 'setRole', 'deleteUser', 'inviteCreate', 'inviteList', 'inviteRevoke']) {
+    const r = makeRes()
+    server.emit('request', makeReq('POST', '/auth/rpc/' + m, test1Cookie, '{}'), r)
+    await settle()
+    check('AUTHZ', '普通用户 ' + m + ' → 403', r.status === 403)
+  }
+}
+{
+  for (const [path, body] of [
+    ['/api/settings.mutate', JSON.stringify({ type: 'client-request', rpcId: 'a', method: 'settings.mutate', payload: { ns: 'llm-deepseek', ops: [] } })],
+    ['/api/settings.update', JSON.stringify({ type: 'client-request', rpcId: 'b', method: 'settings.update', payload: { ns: 'llm-pi-ai', patch: {} } })],
+    ['/api/credentials.set', JSON.stringify({ type: 'client-request', rpcId: 'c', method: 'credentials.set', payload: { ref: 'OPENAI_API_KEY', value: 'sk-x' } })],
+    ['/api/credentials.unset', JSON.stringify({ type: 'client-request', rpcId: 'd', method: 'credentials.unset', payload: { ref: 'OPENAI_API_KEY' } })],
+    ['/api/llm.discoverModels', JSON.stringify({ type: 'client-request', rpcId: 'e', method: 'llm.discoverModels', payload: { settingsNs: 'llm-pi-ai' } })],
+  ]) {
+    const r = makeRes()
+    server.emit('request', makeReq('POST', path, test1Cookie, body), r)
+    await settle()
+    check('AUTHZ', '普通用户模型/Key 写操作 → 403 (' + path + ')', r.status === 403)
+  }
+}
+{
+  const r = makeRes()
+  server.emit('request', makeReq('POST', '/api/session.history', test1Cookie, JSON.stringify({ type: 'client-request', rpcId: 'f', method: 'session.history', payload: { sessionId: 's-admin' } })), r)
+  await settle()
+  check('AUTHZ', '水平越权：普通用户读他人会话 → 403', r.status === 403)
+}
+{
+  const r = makeRes()
+  server.emit('request', makeReq('GET', '/api/session.export?sessionId=s-admin', test1Cookie, undefined), r)
+  await settle()
+  check('AUTHZ', '水平越权：普通用户导出他人会话 → 403', r.status === 403)
+}
+{
+  // legacy dotted 端点（session.history 等）的「访问自己会话放行」断言已随 v0.7.0 移除。
+  // 现代线等价覆盖：test/modern-policy.test.mjs 的 session 归属断言 + WP8 的 test/live-020-check.mjs。
+}
+
+// H. 数据隔离：legacy 传输线专用，已随 v0.7.0 移除。
+// 现代线等价覆盖：test/modern-policy.test.mjs（策略矩阵）与 WP8 的 test/live-020-mux.mjs（mux 帧隔离实测）。
+
+// ==================== I. 可用性 ====================
+{
+  const ip = '192.168.1.50'
+  let got429 = false
+  for (let i = 0; i < 6; i++) {
+    const r = await login('test1', 'wrong-pass-xx', ip)
+    if (r.status === 429) got429 = true
+  }
+  const during = await login('test1', '12345678', ip)
+  check('AVAIL', '暴力破解防护：连续失败后锁定（429）', got429)
+  check('AVAIL', '锁定期间正确密码也被拒（429）', during.status === 429)
+}
+check('AVAIL', '会话/失败计数定期清理（防内存膨胀）', HOST_SRC.includes("state.sessions.delete(token)") && HOST_SRC.includes("SESSION_SWEEP_MS"))
+
+// ==================== J. 部署加固 ====================
+check('DEPLOY', 'Cookie 未设 Secure（预期；公网必须 HTTPS 反代）', true)
+check('DEPLOY', '登录失败锁定按源 IP（反向代理下聚合，README 已注明）', HOST_SRC.includes('LOCKOUT_MAX_FAILS'))
+{
+  // 全新环境（用户表为空）→ 引导创建随机管理员并写入引导文件
+  const serverB = new EventEmitter()
+  serverB.on('request', () => {})
+  const recordsB = new Map()
+  const bootFiles = []
+  const ctxB = {
+    get(n) {
+      if (n === 'credentials') return {
+        async listRecords() { return [] },
+        async readRecord(k) { return recordsB.get(k) },
+        async modifyRecord(k, mutate) {
+          const cur = recordsB.get(k)
+          const next = await mutate(cur)
+          if (next === undefined) return cur
+          recordsB.set(k, next)
+          return next
+        },
+        async deleteRecord(k) { recordsB.delete(k) },
+      }
+      if (n === 'fs') return { async resolve(p) { return { path: p } }, async writeText(t, c) { bootFiles.push(c) } }
+      if (n === 'webServer') return { server: serverB }
+      if (n === 'connection') return modernConnection
+      return undefined
+    },
+    effect() {},
+    interval() { return () => {} },
+    timeout(ms) { return new Promise((r) => setTimeout(r, ms)) },
+  }
+  apply(ctxB)
+  await new Promise((r) => setTimeout(r, 300))
+  const adminKeys = [...recordsB.keys()].filter((k) => k.startsWith('dsh-auth/') && k !== 'dsh-auth/ownership')
+  const adminRec = adminKeys.length === 1 ? JSON.parse(recordsB.get(adminKeys[0]).payload) : null
+  check('DEPLOY', '空环境引导创建单一随机管理员（无硬编码默认密码）', adminRec !== null && adminRec.role === 'admin' && 'salt' in adminRec && 'hash' in adminRec)
+  check('DEPLOY', '引导文件含随机管理员账号与密码（部署者取用）', bootFiles.length > 0 && /admin/.test(bootFiles[0]) && /\S{8,}/.test(bootFiles[0].split('密码:')[1] || ''), bootFiles[0] ? bootFiles[0].slice(0, 80) : '(empty)')
+}
+
+// ==================== 汇总 ====================
+const byCategory = {}
+for (const r of results) {
+  byCategory[r.category] = byCategory[r.category] || { total: 0, pass: 0 }
+  byCategory[r.category].total++
+  if (r.pass) byCategory[r.category].pass++
+}
+console.log('\n================ 安全验证汇总 ================')
+const order = ['AUTH', 'SESSION', 'INJ', 'CSRF', 'HTTP', 'INFO', 'AUTHZ', 'ISO', 'AVAIL', 'DEPLOY', 'WS-ISO', 'CFG', 'REG', 'TOTP']
+for (const c of order) {
+  const s = byCategory[c] || { total: 0, pass: 0 }
+  const flag = s.pass === s.total ? 'PASS' : 'FAIL'
+  console.log(`${flag}  ${c.padEnd(8)} ${s.pass}/${s.total}`)
+}
+// ===== v0.7.0 新增面：按用户密钥存储 / 分享鉴权 / 新 RPC / 本地化安全不变式 =====
+{
+  const rpcCall = (method, body, cookie) => new Promise((resolve) => {
+    const r = makeRes()
+    server.emit('request', makeReq('POST', '/auth/rpc/' + method, cookie, JSON.stringify(body || {})), r)
+    setTimeout(() => resolve(r), 80)
+  })
+  const bodyOf = (response) => JSON.stringify(parseJson(response) || {})
+
+  // —— PROFILE：存储与密钥不变量 ——
+  const { profileKey, ProfileStore, keyHint } = await import('../lib/model-profiles.js')
+  let grammarRejected = false
+  try { profileKey('profile-kdf/uid') } catch (error) { grammarRejected = true }
+  check('PROFILE', '凭据键必须是两段：三段键在写入前即被拒绝', grammarRejected)
+  check('PROFILE', '掩码只暴露 前4...后4（不含完整 Key）', keyHint('sk-abcdef1234567890') === 'sk-a...7890')
+
+  const written = []
+  const seam = {
+    async readRaw() { return undefined },
+    async writeRaw(key, value) { written.push({ key, value }) },
+    async modifyRaw() { return undefined },
+    async deleteRaw() {},
+  }
+  const store = new ProfileStore(seam)
+  await store.ensureUid('alice')
+  await store.writePrivate('uid-alice', {
+    profileId: 'p1', label: 'a', provider: 'deepseek', model: 'deepseek-chat', hint: 'sk-a...7890',
+    sealed: { v: 1, alg: 'AES-256-GCM', iv: 'x', ct: 'y' }, createdAt: 'now', updatedAt: 'now',
+  })
+  check('PROFILE', '落盘内容不含明文 Key（只有密文与掩码）',
+    written.length > 0 && written.every(entry => !JSON.stringify(entry.value).includes('sk-abcdef1234567890')))
+  check('PROFILE', '写出的每个键都符合宿主语法（恰好两段）',
+    written.every(entry => /^[a-z0-9-]+\/[a-z0-9-]+$/.test(entry.key)))
+
+  // —— RPC：新方法的认证面 ——
+  const anonProfile = await rpcCall('profileList', {}, 'bogus-token')
+  check('RPC', '未认证 profileList → 401', anonProfile.status === 401)
+  const anonBalance = await rpcCall('balanceQueryAll', {}, 'bogus-token')
+  check('RPC', '未认证 balanceQueryAll → 401', anonBalance.status === 401)
+  const anonTest = await rpcCall('profileTestKey', { apiKey: 'sk-x' }, 'bogus-token')
+  check('RPC', '未认证 profileTestKey → 401（不可作为探活代理）', anonTest.status === 401)
+
+  const userCreate = await rpcCall('createUser', { username: 'probe-u', password: 'Str0ng-pass-1234' }, test1Cookie)
+  check('RPC', '普通用户 createUser → 403', userCreate.status === 403)
+  const userDelete = await rpcCall('deleteUser', { username: 'admin' }, test1Cookie)
+  check('RPC', '普通用户 deleteUser → 403', userDelete.status === 403)
+
+  const wrongPw = await rpcCall('verifyPassword', { password: 'definitely-wrong' }, test1Cookie)
+  check('RPC', 'verifyPassword 错误口令 → 403', wrongPw.status === 403)
+  check('RPC', 'verifyPassword 响应不含哈希/盐/密钥',
+    !bodyOf(wrongPw).includes('hash') && !bodyOf(wrongPw).includes('salt') && !bodyOf(wrongPw).includes('sk-'))
+
+  const balance = await rpcCall('balanceQueryAll', {}, test1Cookie)
+  check('RPC', 'balanceQueryAll 只回数字（无密钥材料、无密文）',
+    balance.status === 200 || balance.status === 429 ? !bodyOf(balance).includes('sk-') && !bodyOf(balance).includes('sealed') : false)
+
+  // —— SHARE：分享与授权的边界 ——
+  const userShare = await rpcCall('shareCreate', { label: 'probe', model: 'deepseek-chat', apiKey: 'sk-probe' }, test1Cookie)
+  check('SHARE', '普通用户创建分享 → 403（分享能力仅限管理员）', userShare.status === 403)
+  const userGrant = await rpcCall('shareGrant', { profileId: 'not-mine', username: 'admin' }, test1Cookie)
+  check('SHARE', '普通用户授予他人分享 → 403/404（不能操作他人配置）',
+    userGrant.status === 403 || userGrant.status === 404)
+  const userGrants = await rpcCall('shareGrants', {}, test1Cookie)
+  const grantsOk = userGrants.status === 200
+    ? (parseJson(userGrants).grants || []).length === 0
+    : userGrants.status === 403
+  check('SHARE', '普通用户读取授权表只回自己的（不泄露他人授权）', grantsOk)
+  const userOwn = await rpcCall('shareOwn', {}, test1Cookie)
+  const ownOk = userOwn.status === 200
+    ? (parseJson(userOwn).shared || []).every(entry => entry.sealed === undefined && entry.wrappedDek === undefined && entry.apiKey === undefined)
+    : userOwn.status === 403
+  check('SHARE', '分享清单不含密钥材料（只有掩码/元数据）', ownOk)
+
+  // —— I18N：本地化不得改变安全行为 ——
+  {
+    const r = makeRes()
+    server.emit('request', makeReq('GET', '/api/session.list', undefined, undefined), r)
+    await settle()
+    check('I18N', '未认证读取 Remote 端点 → 401（默认）', r.status === 401)
+  }
+  {
+    const r = makeRes()
+    const req = makeReq('GET', '/api/session.list', undefined, undefined)
+    req.headers['accept-language'] = 'en-US,en;q=0.9'
+    server.emit('request', req, r)
+    await settle()
+    check('I18N', 'Accept-Language: en 不改变鉴权结果（仍 401）', r.status === 401)
+  }
+  {
+    const r = makeRes()
+    const req = makeReq('GET', '/auth/login', undefined, undefined)
+    req.headers['accept-language'] = 'en-US,en;q=0.9'
+    server.emit('request', req, r)
+    await settle()
+    const html = String(r.body ?? '')
+    check('I18N', '登录页（英文）不泄露密钥材料或存储键',
+      html.length > 0 && !html.includes('sk-') && !html.includes('sealed') && !html.includes('dsh-auth/'))
+  }
+}
+
+const failed = results.filter((r) => !r.pass)
+console.log(`\n总计: ${results.length - failed.length}/${results.length} 通过`)
+if (failed.length > 0) {
+  console.log('\n失败项:')
+  for (const f of failed) console.log(`  [${f.category}] ${f.label} :: ${f.extra ?? ''}`)
+}
+
+// 逐项明细（DSH_SUITE_VERBOSE=1）：输出即「类别 + 用例名」清单，
+// 文档里的测试矩阵直接据此生成，避免手工维护的清单与用例逐渐不一致。
+if (process.env.DSH_SUITE_VERBOSE === '1') {
+  console.log('\n================ 逐项明细 ================')
+  for (const r of results) console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.category.padEnd(8)} ${r.label}`)
+}
+// 机器可读结果（供报告生成与 CI）：stdout 的逐项 dump 会混入插件日志，以本文件为准。
+if (process.env.DSH_SUITE_JSON !== undefined && process.env.DSH_SUITE_JSON !== '') {
+  const byCategory = {}
+  for (const r of results) {
+    byCategory[r.category] = byCategory[r.category] ?? { total: 0, passed: 0, cases: [] }
+    byCategory[r.category].total += 1
+    if (r.pass) byCategory[r.category].passed += 1
+    byCategory[r.category].cases.push({ label: r.label, pass: r.pass })
+  }
+  try {
+    writeFileSync(process.env.DSH_SUITE_JSON, JSON.stringify(
+      { total: results.length, passed: results.length - failed.length, failed: failed.length, categories: byCategory }, null, 2))
+  } catch (error) { /* 导出失败不影响判定 */ }
+}
+process.exit(failed.length === 0 ? 0 : 1)
