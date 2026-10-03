@@ -1361,12 +1361,18 @@
 			var editingS = _s(null as any), editing = editingS[0], setEditing = editingS[1]
 			var draftMembersS = _s([] as string[]), draftMembers = draftMembersS[0], setDraftMembers = draftMembersS[1]
 			var draftNameS = _s(''), draftName = draftNameS[0], setDraftName = draftNameS[1]
+			var draftWsS = _s(''), draftWs = draftWsS[0], setDraftWs = draftWsS[1]
+			var spacesS = _s([] as any[]), spaces = spacesS[0], setSpaces = spacesS[1]
+			var myWsS = _s(null as any), myWs = myWsS[0], setMyWs = myWsS[1]
 
 			function load(): void {
+				// 私有空间：人人有份，面板顶部展示（没建过时给一个按钮）
+				rpc('myWorkspace', {}).then(function (j) { setMyWs(j) }).catch(function () { /* 面板降级 */ })
 				rpc('me', {}).then(function (j) {
 					setMe(j.me || null)
 					if (j.me !== undefined && j.me.role === 'admin') {
 						rpc('listUsers', {}).then(function (u) { setUsers(u.users || []) }).catch(function () { /* 成员选择器降级 */ })
+						rpc('adminListWorkspaces', {}).then(function (w) { setSpaces(w.workspaces || []) }).catch(function () { /* 绑定向导降级 */ })
 						return rpc('listGroups', {}).then(function (g) { setGroups(g.groups || []) })
 					}
 					return rpc('myGroups', {}).then(function (g) { setGroups(g.groups || []) })
@@ -1399,8 +1405,21 @@
 				var memberCell = members.length === 0
 					? React.createElement('span', { className: 'muted' }, '暂无成员')
 					: React.createElement('span', null, members.join('、'))
+				var ws = group.workspace
+				var workspaceCell = ws === null || ws === undefined
+					? React.createElement('span', { className: 'muted' }, '未绑定')
+					: React.createElement('span', null, ws.title,
+						React.createElement('div', { className: 'meta' }, ws.path !== '' ? ws.path : ws.workspaceId))
 				var actions: any[] = []
 				if (isAdmin()) {
+					actions.push(React.createElement('button', {
+						key: 'w', className: 'ghost', disabled: busy,
+						onClick: function () {
+							if (isEditing && editing.mode === 'workspace') { setEditing(null); return }
+							setDraftWs(ws === null || ws === undefined ? '' : ws.workspaceId)
+							setEditing({ id: group.id, mode: 'workspace' })
+						},
+					}, isEditing && editing.mode === 'workspace' ? '收起' : '工作区'))
 					actions.push(React.createElement('button', {
 						key: 'm', className: 'ghost', disabled: busy,
 						onClick: function () { isEditing && editing.mode === 'members' ? setEditing(null) : editMembers(group) },
@@ -1418,6 +1437,44 @@
 					}, '删除'))
 				}
 				var editor: any = null
+				if (isEditing && editing.mode === 'workspace') {
+					// 候选：未绑定的部署工作区（别人的私有空间与已属于其它组的工作区不列出）
+					var candidates = spaces.filter(function (item: any) {
+						if (item.privateOf !== null && item.privateOf !== undefined) return false
+						return item.groupId === null || item.groupId === undefined || item.groupId === group.id
+					})
+					editor = React.createElement('div', { className: 'card' },
+						React.createElement('div', { className: 'muted' },
+							'组工作区（项目空间）：组内成员都能在这里建会话，其中的会话对组内可读；写入仍只归会话归属人。'),
+						React.createElement('div', { className: 'row' },
+							React.createElement('select', {
+								value: draftWs,
+								onChange: function (ev: any) { setDraftWs(ev.target.value) },
+							},
+								React.createElement('option', { value: '' }, '— 选择已有工作区 —'),
+								candidates.map(function (item: any) {
+									return React.createElement('option', { key: item.workspaceId, value: item.workspaceId },
+										(item.title || item.workspaceId) + (item.path !== '' ? ' · ' + item.path : ''))
+								}),
+							),
+							React.createElement('button', {
+								disabled: busy || draftWs === '',
+								onClick: function () { run(rpc('setGroupWorkspace', { id: group.id, workspaceId: draftWs }), '已绑定组工作区') },
+							}, '绑定'),
+							React.createElement('button', {
+								className: 'ghost', disabled: busy,
+								onClick: function () { run(rpc('ensureGroupWorkspace', { id: group.id }), '已创建组工作区') },
+							}, '创建组工作区'),
+							ws === null || ws === undefined ? null : React.createElement('button', {
+								className: 'ghost', disabled: busy,
+								onClick: function () { run(rpc('setGroupWorkspace', { id: group.id, workspaceId: '' }), '已解除绑定（该工作区退回私有）') },
+							}, '解除绑定'),
+						),
+						candidates.length === 0
+							? React.createElement('div', { className: 'muted' }, '没有可绑定的工作区：用「创建组工作区」建一个（目录在私有空间根目录下的 groups/）。')
+							: null,
+					)
+				}
 				if (isEditing && editing.mode === 'members') {
 					editor = React.createElement('div', { className: 'card' },
 						React.createElement('div', { className: 'muted' }, '勾选成员（只能由管理员分配）'),
@@ -1454,15 +1511,35 @@
 				return React.createElement('tr', { key: group.id },
 					React.createElement('td', null, group.name),
 					React.createElement('td', null, memberCell),
+					React.createElement('td', null, workspaceCell),
 					React.createElement('td', null, actions.length === 0 ? React.createElement('span', { className: 'muted' }, '只读') : actions),
-					editor === null ? null : React.createElement('td', { colSpan: 3 }, editor),
+					editor === null ? null : React.createElement('td', { colSpan: 4 }, editor),
 				)
 			})
 
+			var mySpace: any = myWs !== null && myWs.workspace !== null && myWs.workspace !== undefined ? myWs.workspace : null
+			var mySpaceText = mySpace !== null
+				? (mySpace.title || mySpace.workspaceId) + ' · ' + (mySpace.path !== '' ? mySpace.path : mySpace.workspaceId)
+				: (myWs !== null && myWs.provisionable === false
+					? '宿主未提供 workspaceRegistry 服务，无法自动创建（请联系部署方升级 DSH）'
+					: '尚未创建')
 			var children: any[] = [
 				React.createElement('h2', { key: 'h' }, isAdmin() ? '组管理（管理员）' : '我的项目组'),
 				React.createElement('p', { key: 'p', className: 'muted' },
-					'组对应一个项目。会话权限：仅本人可写；同组成员可读；管理员可读（不可写他人会话）。'),
+					'组对应一个项目：每个组有一个组工作区，在组工作区里创建的会话对组内成员可读。'
+					+ '会话权限：仅本人可写；对象所属组的成员可读；管理员可读（不可写他人会话）。'
+					+ '没有绑定组的工作区与会话是私有的 —— 只有本人与管理员可读。'),
+				React.createElement('div', { key: 'myws', className: 'card' },
+					React.createElement('div', null, '我的私有空间'),
+					React.createElement('div', { className: 'meta' }, mySpaceText),
+					React.createElement('div', { className: 'muted' },
+						'在私有空间里建的会话只有你与管理员能看。要让同事看到，请让管理员把你加入某个组，'
+						+ '并在该组的组工作区里建会话。'),
+					React.createElement('button', {
+						className: 'ghost', disabled: busy,
+						onClick: function () { run(rpc('ensureMyWorkspace', {}), '私有空间已就绪') },
+					}, mySpace !== null ? '重新检查' : '创建私有空间'),
+				),
 				err === '' ? null : React.createElement('p', { key: 'e', className: 'err' }, err),
 				msg === '' ? null : React.createElement('p', { key: 'm', className: 'meta' }, msg),
 			]
@@ -1483,14 +1560,24 @@
 					}, '创建组'),
 				))
 			}
+			if (isAdmin()) {
+				children.push(React.createElement('div', { key: 'provision', className: 'row' },
+					React.createElement('button', {
+						className: 'ghost', disabled: busy,
+						onClick: function () { run(rpc('adminProvisionWorkspaces', {}), '已为所有账户创建/校验私有空间') },
+					}, '为所有账户创建私有空间'),
+					React.createElement('span', { className: 'muted' }, '目录：私有空间根目录 / users/<用户名>'),
+				))
+			}
 			children.push(React.createElement('table', { key: 't' },
 				React.createElement('thead', null, React.createElement('tr', null,
 					React.createElement('th', null, '组名'),
 					React.createElement('th', null, '成员'),
+					React.createElement('th', null, '组工作区'),
 					React.createElement('th', null, '操作'),
 				)),
 				React.createElement('tbody', null, rows.length === 0
-					? React.createElement('tr', null, React.createElement('td', { colSpan: 3, className: 'muted' }, isAdmin() ? '还没有组' : '你还没有加入任何组'))
+					? React.createElement('tr', null, React.createElement('td', { colSpan: 4, className: 'muted' }, isAdmin() ? '还没有组' : '你还没有加入任何组'))
 					: rows),
 			))
 			return React.createElement('div', { className: 'dshua' }, children)
@@ -1511,6 +1598,7 @@
 			var metaS = _s(''), meta = metaS[0], setMeta = metaS[1]
 			var pickedS = _s(''), picked = pickedS[0], setPicked = pickedS[1]
 			var openS = _s(null as any), open = openS[0], setOpen = openS[1]
+			var groupFilterS = _s(''), groupFilter = groupFilterS[0], setGroupFilter = groupFilterS[1]
 
 			function refresh(): void {
 				setLoading(true); setErr('')
@@ -1528,7 +1616,8 @@
 				rpc('adminSessionRead', { id: entry.id }).then(function (j) {
 					setOpen({ loading: false, error: '', sessionId: j.sessionId, owner: j.owner,
 						title: (j.transcript && j.transcript.title) || entry.title || j.sessionId,
-						createdAt: j.createdAt, cwd: j.cwd, live: j.live, transcript: j.transcript })
+						createdAt: j.createdAt, cwd: j.cwd, live: j.live, transcript: j.transcript,
+						group: j.group || entry.group, workspaceId: j.workspaceId || entry.workspaceId })
 				}).catch(function (e) {
 					setOpen({ loading: false, error: errText(e), sessionId: entry.id, title: entry.title || entry.id })
 				})
@@ -1549,6 +1638,8 @@
 					React.createElement('p', { key: 'meta', className: 'muted' },
 						'归属：' + (open.owner || '—') + ' · 创建：' + stamp(open.createdAt)
 						+ (open.cwd ? ' · 目录：' + open.cwd : '')
+						+ (open.group ? ' · 组：' + open.group : ' · 私有')
+						+ (open.workspaceId ? ' · 工作区：' + open.workspaceId : '')
 						+ (open.live ? ' · 打开过（有归属记录）' : '')),
 					open.error === '' ? null : React.createElement('p', { key: 'e', className: 'err' }, open.error),
 				]
@@ -1602,18 +1693,33 @@
 				}, user.username + '（' + user.sessions.length + '）')
 			})
 
+			// 组筛选：同一用户的会话可能横跨「私有」与多个组
+			var filterKeys: string[] = []
+			if (selected !== null) {
+				selected.sessions.forEach(function (entry: any) {
+					var key = entry.group ? entry.group : '__private__'
+					if (filterKeys.indexOf(key) === -1) filterKeys.push(key)
+				})
+			}
 			var sessionRows: any[] = []
 			if (selected !== null) {
-				sessionRows = selected.sessions.map(function (entry: any) {
+				var visibleSessions = groupFilter === ''
+					? selected.sessions
+					: selected.sessions.filter(function (entry: any) { return (entry.group ? entry.group : '__private__') === groupFilter })
+				sessionRows = visibleSessions.map(function (entry: any) {
 					return React.createElement('div', { key: entry.id, className: 'card' },
 						React.createElement('div', { className: 'row' },
 							React.createElement('button', { onClick: function () { readSession(entry) } }, '打开'),
 							React.createElement('span', null, entry.title || '(无标题)')),
 						React.createElement('div', { className: 'meta' },
-							stamp(entry.createdAt) + ' · ' + entry.id + (entry.live ? ' · 运行中' : '')))
+							stamp(entry.createdAt) + ' · ' + entry.id
+							+ (entry.group ? ' · 组：' + entry.group : ' · 私有')
+							+ (entry.workspaceId ? ' · 工作区：' + entry.workspaceId : '')
+							+ (entry.live ? ' · 运行中' : '')))
 				})
 				if (sessionRows.length === 0) {
-					sessionRows.push(React.createElement('p', { key: 'none', className: 'muted' }, '该用户还没有会话。'))
+					sessionRows.push(React.createElement('p', { key: 'none', className: 'muted' },
+						groupFilter === '' ? '该用户还没有会话。' : '该用户在这个筛选条件下没有会话。'))
 				}
 			}
 
@@ -1626,6 +1732,19 @@
 							? React.createElement('span', { className: 'muted' }, '选择左侧用户查看其会话')
 							: React.createElement('div', null,
 								React.createElement('p', { className: 'meta' }, '用户：' + selected.username),
+								filterKeys.length > 1
+									? React.createElement('div', { className: 'row' },
+										React.createElement('select', {
+											value: groupFilter,
+											onChange: function (ev: any) { setGroupFilter(ev.target.value) },
+										},
+											React.createElement('option', { value: '' }, '全部（含私有）'),
+											filterKeys.map(function (key: string) {
+												return React.createElement('option', { key: key, value: key },
+													key === '__private__' ? '私有（无组）' : '组：' + key)
+											}),
+										))
+									: null,
 								sessionRows))))))
 
 			return React.createElement('div', { className: 'dshua' }, children)

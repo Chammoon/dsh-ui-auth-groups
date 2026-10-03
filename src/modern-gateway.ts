@@ -25,7 +25,10 @@ const MUX_PATH = '/api/remote.mux'
 /** Exact `/api` Fetch routes that bypass Remote dispatch (0.1.5 inventory). */
 const HOST_CAPABILITY_PATHS = new Set(['/api/file', '/api/present.host', '/api/present.open'])
 /** Own-session browser routes whose ownership is the `sessionId` query parameter. */
-const SESSION_QUERY_PATHS = new Set(['/api/session.export', '/api/session/uploadFileBinary'])
+/** Read-side routes that address a session by query parameter (group-aware read predicate). */
+const SESSION_EXPORT_PATHS = new Set(['/api/session.export'])
+/** Write-side route (stages bytes under a session): owner only, exactly like `fileUploads/upload`. */
+const SESSION_UPLOAD_PATHS = new Set(['/api/session/uploadFileBinary'])
 /** Host-side app opening; never an ordinary-user capability. */
 const HOST_OPEN_PREFIX = '/open-in-app/'
 
@@ -55,14 +58,21 @@ export interface ModernAuth {
   loginKey(req: IncomingMessage): string
   session(id: string): string
   workspace(id: string): string
+  /** 会话冻结的组绑定（无 = 私有会话）。 */
+  sessionGroup(id: string): string | undefined
+  /** 会话创建时所在的工作区（fork 继承用）。 */
+  sessionWorkspace(id: string): string | undefined
+  /** 工作区绑定的组（无 = 私有工作区）。 */
+  workspaceGroup(id: string): string | undefined
+  /**
+   * 成员关系：`username` 是否属于 `groupId`。
+   * 可见性判定是「查看者 ∈ 对象所属组」，因此这里只回答成员关系。
+   */
+  isMember(username: string, groupId: string): boolean
   sessionExists(id: string): Promise<boolean>
   claimSession(id: string, username: string): Promise<void>
   claimWorkspace(id: string, username: string): Promise<void>
-  /**
-   * 组可见性：`viewer` 与 `owner` 是否至少同属一个组（组会话只读共享）。
-   * 未提供该回调 = 本部署未启用组功能，全部行为与上游一致。
-   */
-  sharesGroup?(viewer: string, owner: string): boolean
+  bindSession(id: string, workspaceId: string | undefined, groupId: string | undefined): Promise<void>
   /**
    * R2：按登录用户返回模型授权范围（provider + 逐模型）。返回 undefined 表示不裁剪；
    * 管理员在策略层直接绕过，不会走到这里。
@@ -230,10 +240,6 @@ function errorMessage(error: unknown): string {
 export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth): ModernGateway {
   const policy: ModernPolicy = createModernPolicy(auth, {
     ...(auth.entitlement === undefined ? {} : { entitlement: auth.entitlement }),
-    // 组可见性接线：读谓词由此获得「同组可读」能力（写谓词不受影响）。
-    ...(auth.sharesGroup === undefined
-      ? {}
-      : { sharesGroup: (viewer: string, owner: string): boolean => auth.sharesGroup?.(viewer, owner) === true }),
   })
   const policies = new Map<string, PolicyRules>()
   const principalByRequest = new WeakMap<IncomingMessage, Principal>()
@@ -267,9 +273,16 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
     return matches[0]?.[kind]
   }
 
-  /** Own a `sessionId` query parameter on the exact `/api` routes that bypass Remote dispatch. */
+  /** Own a `sessionId` query parameter on the read-side `/api` routes that bypass Remote dispatch. */
   function ownsQuerySession(who: Principal, url: URL): boolean {
-    if (who.role === 'admin') return true
+    // 与 Remote 面同一套读谓词：管理员、归属人本人，以及组会话的组内成员。
+    return policy.session(who, url.searchParams.get('sessionId'))
+  }
+  /**
+   * Write-side query session (binary upload stages bytes under the addressed session).
+   * 与 Remote 面的 `fileUploads/upload` 同一谓词：**仅归属人本人**（组内可读不等于可写）。
+   */
+  function ownsQuerySessionWrite(who: Principal, url: URL): boolean {
     const sessionId = url.searchParams.get('sessionId')
     return nonempty(sessionId) && auth.session(sessionId) === who.username
   }
@@ -343,8 +356,9 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
       if (who.role !== 'admin') { json(res, 403, { error: 'Access denied' }); return true }
       return false
     }
-    if (SESSION_QUERY_PATHS.has(pathname)) {
-      if (!ownsQuerySession(who, url)) { json(res, 403, { error: 'Access denied' }); return true }
+    if (SESSION_EXPORT_PATHS.has(pathname) || SESSION_UPLOAD_PATHS.has(pathname)) {
+      const granted = SESSION_UPLOAD_PATHS.has(pathname) ? ownsQuerySessionWrite(who, url) : ownsQuerySession(who, url)
+      if (!granted) { json(res, 403, { error: 'Access denied' }); return true }
       return false
     }
     if (pathname === MUX_PATH) {
@@ -390,7 +404,9 @@ export function createModernGateway(ctx: ModernGatewayContext, auth: ModernAuth)
     try {
       await forwardJson(forward, request, res, async value => {
         const rule = endpoint === '$events/result' ? undefined : extension('rpc', endpoint)
-        const projected = rule ? await rule.project(who, value) : await policy.result(who, endpoint, value)
+        const projected = rule
+          ? await rule.project(who, value)
+          : await policy.result(who, endpoint, value, envelope.payload)
         const current = principal(req)
         if (current?.role !== who.role || current.username !== who.username) throw denial()
         return projected

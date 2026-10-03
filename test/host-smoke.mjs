@@ -3,7 +3,15 @@
 // then drive the real gate: bootstrap admin, redirects, 401s, login, RPC,
 // and passthrough to the original request listener.
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { name, inject, apply, totpCodeAt } from '../lib/index.js'
+
+// 私有空间根目录：真实建目录（供给路径用的是 node:fs/promises，不是 mock fs），
+// 所以这里给一个临时目录，退出时清掉。必须在 apply() 之前设置（env 在 apply 时读取）。
+const spacesRoot = mkdtempSync(join(tmpdir(), 'dsh-ui-auth-spaces-'))
+process.env.DSH_AUTH_WORKSPACES_DIR = spacesRoot
 
 // 会话 Cookie 名由插件按 DSH_HOME 派生（同一实例内稳定、实例间不同）；测试用同一公式。
 const COOKIE_NAME = 'dsh_auth_' + (() => {
@@ -76,20 +84,36 @@ const fakeSessions = {
   'session-alpha': { title: '甲的会话', live: true, createdAt: 1700000000000 },
   'session-beta': { title: '乙的会话', live: false, createdAt: 1700000100000 },
 }
+// 经网关（/api/session/create）真实创建出来的会话 id：管理员「按用户浏览会话」也要能列出它们。
+const gatewaySessions = []
 const sessionQueryMock = {
   async listSessions() {
-    return Object.entries(fakeSessions).map(([id, s]) => ({
+    const fixed = Object.entries(fakeSessions).map(([id, s]) => ({
       header: { id, createdAt: s.createdAt, cwd: '/tmp/' + id },
       live: s.live,
       persisted: true,
     }))
+    return fixed.concat(gatewaySessions.map((id) => ({
+      header: { id, createdAt: 1700000200000, cwd: '/tmp/gateway/' + id },
+      live: false,
+      persisted: true,
+    })))
   },
   async readTitle(id) {
     const s = fakeSessions[id]
     return s === undefined ? undefined : { title: s.title }
   },
   async readSession(id) {
-    if (fakeSessions[id] === undefined) throw new Error('session not found')
+    if (fakeSessions[id] === undefined && gatewaySessions.indexOf(id) === -1) throw new Error('session not found')
+    if (fakeSessions[id] === undefined) {
+      return {
+        session: { createdAt: 1700000200000, cwd: '/tmp/gateway/' + id },
+        events: [
+          { type: 'user/message', seq: 1, time: 1700000200001, data: { content: [{ type: 'text', text: '网关建会话' }], source: { kind: 'user' } } },
+          { type: 'session/title', seq: 2, time: 1700000200002, data: { title: '网关会话' } },
+        ],
+      }
+    }
     return {
       session: { createdAt: fakeSessions[id].createdAt, cwd: '/tmp/' + id },
       events: [
@@ -101,6 +125,29 @@ const sessionQueryMock = {
     }
   },
 }
+// ---- mock 宿主工作区注册表（ctx.workspaceRegistry）：按 canonical path 去重 ----
+const workspaceRegistryMock = (() => {
+  const byPath = new Map()
+  const byId = new Map()
+  let seq = 0
+  return {
+    byPath,
+    byId,
+    async create(path, title) {
+      const key = String(path).replace(/\/+$/, '')
+      const existing = byPath.get(key)
+      if (existing !== undefined) return existing
+      seq += 1
+      const record = { id: 'ws-' + seq, path: key, title: title !== undefined ? title : key.split('/').pop(), sessionIds: [] }
+      byPath.set(key, record)
+      byId.set(record.id, record)
+      return record
+    },
+    get(id) { return byId.get(id) },
+    list() { return [...byId.values()] },
+  }
+})()
+
 const ctx = {
   get(name2) {
     if (name2 === 'credentials') return creds
@@ -108,6 +155,7 @@ const ctx = {
     if (name2 === 'webServer') return { server }
     if (name2 === 'connection') return modernConnection
     if (name2 === 'sessionQuery') return sessionQueryMock
+    if (name2 === 'workspaceRegistry') return workspaceRegistryMock
     return undefined
   },
   effect(cb) { disposers.push(cb) },
@@ -153,6 +201,12 @@ function makeRes() {
   const res = { headersSent: false, status: 0, headers: {}, body: '', destroyed: false }
   res.writeHead = (s, h) => { res.status = s; Object.assign(res.headers, h || {}); res.headersSent = true }
   res.setHeader = (k, v) => { res.headers[k] = v }
+  res.getHeaders = () => res.headers
+  res.removeHeader = (k) => { delete res.headers[k] }
+  res.getHeaders = () => res.headers
+  res.removeHeader = (k) => { delete res.headers[k] }
+  res.on = () => res
+  res.once = () => res
   res.write = (b) => { res.body += (b === undefined ? '' : String(b)); return true }
   res.end = (b) => { if (b !== undefined) res.body += String(b); res.ended = true }
   res.destroy = () => { res.destroyed = true }
@@ -170,13 +224,61 @@ async function post(url, cookie, body) {
   const res = makeRes()
   server.emit('request', makeReq('POST', url, cookie, body), res)
   await settle()
+  // 少数请求要等异步收尾（首次登录会供给私有空间：真实 mkdir + 工作区注册 + 落盘）。
+  for (let i = 0; i < 300 && res.ended !== true; i += 1) await new Promise((r) => setTimeout(r, 5))
   return res
 }
 async function get(url, cookie) {
   const res = makeRes()
   server.emit('request', makeReq('GET', url, cookie), res)
+  await settle()
+  for (let i = 0; i < 300 && res.ended !== true; i += 1) await new Promise((r) => setTimeout(r, 5))
   return res
 }
+
+// ---- mock 宿主 RPC 处理（现代网关转发目标）：只实现两个会话端点 ----
+// 真实宿主用 /api/<endpoint> 收 client-request 信封、回 server-response 信封；
+// 这里让 session/create 返回新的 sessionId、session/list 回全部网关会话，
+// 从而验证「建会话时冻结组/工作区绑定」与「列表按组过滤」这两条真实代码路径。
+server.on('request', (req, res) => {
+  const rawPath = String(req.url).split('?')[0]
+  if (req.method !== 'POST' || !rawPath.startsWith('/api/')) return
+  const method = rawPath.slice('/api/'.length)
+  if (method !== 'session/create' && method !== 'session/list') return
+  ;(async () => {
+    let body = ''
+    const dec = new TextDecoder()
+    for await (const chunk of req) body += dec.decode(chunk, { stream: true })
+    let rpcId = 'x'
+    try { rpcId = JSON.parse(body).rpcId || 'x' } catch (e) { /* keep default */ }
+    let value
+    if (method === 'session/create') {
+      const id = 'gw-session-' + (gatewaySessions.length + 1)
+      gatewaySessions.push(id)
+      value = { sessionId: id }
+    } else {
+      value = { items: gatewaySessions.map((id) => ({ sessionId: id, updatedAt: 1, running: false, blank: false })) }
+    }
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ type: 'server-response', rpcId, result: { ok: true, value } }))
+  })().catch((error) => {
+    res.writeHead(500, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ error: String(error) }))
+  })
+})
+
+// 会话导出（读）与二进制上传（写）两条直连路由：只回 200 表示「已放行到宿主」
+server.on('request', (req, res) => {
+  const rawPath = String(req.url).split('?')[0]
+  const isExport = rawPath === '/api/session.export' && req.method === 'GET'
+  const isUpload = rawPath === '/api/session/uploadFileBinary' && req.method === 'POST'
+  if (!isExport && !isUpload) return
+  const finish = () => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true }))
+  }
+  finish()
+})
 
 // ---- apply the deployed plugin ----
 apply(ctx)
@@ -332,6 +434,198 @@ for (const method of ['adminSessionsByUser', 'adminSessionRead']) {
   const res = await post('/auth/rpc/' + method, bobCookie, JSON.stringify({ id: 'session-alpha' }))
   check('bob (user) ' + method + ' 403', res.status === 403, res.body)
 }
+// ---- 9d) 私有空间 / 组工作区（B1 组工作区 + B3 工作区绑定组；无组 = 私有） ----
+// bob 在 9) 里登录过：登录路径应当已经给他建好私有空间（不阻塞登录，超时后台继续）。
+let bobWorkspaceId
+{
+  const res = await post('/auth/rpc/myWorkspace', bobCookie, '{}')
+  const j = parseJson(res)
+  bobWorkspaceId = j.workspace !== null && j.workspace !== undefined ? j.workspace.workspaceId : undefined
+  check('登录后自动获得私有空间', j.ok === true && typeof bobWorkspaceId === 'string'
+    && j.workspace.path === spacesRoot + '/users/bob', res.body)
+}
+{
+  const res = await post('/auth/rpc/ensureMyWorkspace', bobCookie, '{}')
+  const j = parseJson(res)
+  check('ensureMyWorkspace 幂等（复用同一工作区）', j.ok === true && j.workspace.workspaceId === bobWorkspaceId, res.body)
+}
+{
+  const res = await post('/auth/rpc/adminListWorkspaces', bobCookie, '{}')
+  check('bob (user) adminListWorkspaces 403', res.status === 403, res.body)
+}
+let adminWorkspaceId
+{
+  const res = await post('/auth/rpc/adminProvisionWorkspaces', adminCookie, '{}')
+  const j = parseJson(res)
+  adminWorkspaceId = (j.provisioned || []).filter((row) => row.username === 'admin').map((row) => row.workspaceId)[0]
+  const bobRow = (j.provisioned || []).filter((row) => row.username === 'bob')[0]
+  check('adminProvisionWorkspaces 为全部账户供给且不重复建目录',
+    j.ok === true && j.failed.length === 0 && j.provisioned.length >= 2
+    && bobRow !== undefined && bobRow.workspaceId === bobWorkspaceId, res.body)
+  check('管理员也有自己的私有空间', typeof adminWorkspaceId === 'string' && adminWorkspaceId !== bobWorkspaceId, res.body)
+}
+{
+  const res = await post('/auth/rpc/adminListWorkspaces', adminCookie, '{}')
+  const j = parseJson(res)
+  const rows = j.workspaces || []
+  const bobRow = rows.filter((w) => w.workspaceId === bobWorkspaceId)[0]
+  const adminRow = rows.filter((w) => w.workspaceId === adminWorkspaceId)[0]
+  check('adminListWorkspaces 标出私有空间归属', j.ok === true && bobRow !== undefined
+    && bobRow.privateOf === 'bob' && bobRow.owner === 'bob' && bobRow.groupId === null, res.body)
+  check('adminListWorkspaces 列出管理员私有空间', adminRow !== undefined && adminRow.privateOf === 'admin', res.body)
+}
+let groupWorkspaceId
+{
+  const res = await post('/auth/rpc/ensureGroupWorkspace', adminCookie, JSON.stringify({ id: groupId }))
+  const j = parseJson(res)
+  groupWorkspaceId = j.workspace !== undefined ? j.workspace.workspaceId : undefined
+  check('ensureGroupWorkspace 建出组工作区并绑定', j.ok === true && typeof groupWorkspaceId === 'string'
+    && j.group.workspace.workspaceId === groupWorkspaceId, res.body)
+  check('组工作区目录在 <root>/groups 下', typeof j.workspace.path === 'string'
+    && j.workspace.path.indexOf(spacesRoot + '/groups/') === 0, res.body)
+}
+{
+  const res = await post('/auth/rpc/ensureGroupWorkspace', bobCookie, JSON.stringify({ id: groupId }))
+  check('bob (user) ensureGroupWorkspace 403', res.status === 403, res.body)
+}
+{
+  const res = await post('/auth/rpc/myGroups', bobCookie, '{}')
+  const j = parseJson(res)
+  check('myGroups 带出组工作区（普通用户可见）', j.ok === true && j.groups[0].workspace.workspaceId === groupWorkspaceId, res.body)
+}
+{
+  const res = await post('/auth/rpc/setGroupWorkspace', adminCookie, JSON.stringify({ id: groupId, workspaceId: bobWorkspaceId }))
+  check('私有空间不能改绑为组工作区 400', res.status === 400, res.body)
+}
+{
+  const created = await post('/auth/rpc/createGroup', adminCookie, JSON.stringify({ name: '项目 C' }))
+  const otherId = parseJson(created).group.id
+  const res = await post('/auth/rpc/setGroupWorkspace', adminCookie, JSON.stringify({ id: otherId, workspaceId: groupWorkspaceId }))
+  check('一个工作区不能被两个组抢 409', res.status === 409, res.body)
+  await post('/auth/rpc/removeGroup', adminCookie, JSON.stringify({ id: otherId }))
+}
+{
+  const res = await post('/auth/rpc/setGroupWorkspace', adminCookie, JSON.stringify({ id: groupId, workspaceId: '' }))
+  check('解绑组工作区', parseJson(res).group.workspace === null, res.body)
+  const listed = await post('/auth/rpc/adminListWorkspaces', adminCookie, '{}')
+  const row = (parseJson(listed).workspaces || []).filter((w) => w.workspaceId === groupWorkspaceId)[0]
+  check('解绑后工作区不再是组工作区', row !== undefined && row.groupId === null, listed.body)
+  const back = await post('/auth/rpc/setGroupWorkspace', adminCookie, JSON.stringify({ id: groupId, workspaceId: groupWorkspaceId }))
+  check('重新绑定组工作区', parseJson(back).group.workspace.workspaceId === groupWorkspaceId, back.body)
+}
+{
+  const res = await post('/auth/rpc/setGroupWorkspace', adminCookie, JSON.stringify({ id: groupId, workspaceId: 'ghost-ws' }))
+  check('绑定不存在的工作区 400', res.status === 400, res.body)
+}
+// 网关：真实 /api/session/create 的归属与绑定（响应投影里没有工作区信息，靠请求体推导）
+{
+  await post('/auth/rpc/createUser', adminCookie, JSON.stringify({ username: 'carol', password: 'carol-pw-1234', role: 'user' }))
+  await post('/auth/rpc/createUser', adminCookie, JSON.stringify({ username: 'dave', password: 'dave-pw-1234', role: 'user' }))
+  const carolLogin = await post('/auth/login', undefined, JSON.stringify({ username: 'carol', password: 'carol-pw-1234' }))
+  var carolCookie = cookieOf(carolLogin)
+  const daveLogin = await post('/auth/login', undefined, JSON.stringify({ username: 'dave', password: 'dave-pw-1234' }))
+  var daveCookie = cookieOf(daveLogin)
+  // carol 与 bob（以及 admin）同组；dave 不在任何组
+  await post('/auth/rpc/setGroupMembers', adminCookie, JSON.stringify({ id: groupId, members: ['bob', 'admin', 'carol'] }))
+}
+const callApi = (endpoint, cookie, payload) => post('/api/' + endpoint, cookie, JSON.stringify({
+  type: 'client-request', rpcId: 'gw-' + endpoint, method: endpoint, payload: payload,
+}))
+let groupSessionId
+let privateSessionId
+{
+  const res = await callApi('session/create', bobCookie, { args: { request: { workspaceId: groupWorkspaceId } } })
+  const j = parseJson(res)
+  groupSessionId = j.result !== undefined && j.result.value !== undefined ? j.result.value.sessionId : undefined
+  check('网关 session/create：在组工作区建会话', res.status === 200 && typeof groupSessionId === 'string', res.body)
+}
+{
+  const res = await callApi('session/create', bobCookie, { args: { request: { workspaceId: bobWorkspaceId } } })
+  const j = parseJson(res)
+  privateSessionId = j.result !== undefined && j.result.value !== undefined ? j.result.value.sessionId : undefined
+  check('网关 session/create：在自己的私有空间建会话', res.status === 200 && typeof privateSessionId === 'string', res.body)
+}
+{
+  const res = await callApi('session/create', bobCookie, { args: { request: { workspaceId: adminWorkspaceId } } })
+  check('网关 session/create：别人的私有空间 403', res.status === 403, res.body)
+}
+{
+  const ownership = JSON.parse(records.get('dsh-auth/ownership').payload)
+  check('组会话在落盘归属表里冻结组绑定',
+    ownership.v === 2 && ownership.sessionGroups[groupSessionId] === groupId
+    && ownership.sessionWorkspaces[groupSessionId] === groupWorkspaceId, JSON.stringify(ownership.sessionGroups))
+  check('私有会话不绑定组',
+    ownership.sessionGroups[privateSessionId] === undefined
+    && ownership.sessionWorkspaces[privateSessionId] === bobWorkspaceId, JSON.stringify(ownership.sessionGroups))
+  check('私有空间映射已落盘', ownership.privateWorkspaces.bob === bobWorkspaceId
+    && ownership.privateWorkspaces.admin === adminWorkspaceId, JSON.stringify(ownership.privateWorkspaces))
+  check('工作区组绑定已落盘', ownership.workspaceGroups[groupWorkspaceId] === groupId, JSON.stringify(ownership.workspaceGroups))
+}
+// 列表可见性：组员看得到组会话，看不到别人的私有会话；组外用户什么也看不到
+{
+  const listIds = async (cookie) => {
+    const res = await callApi('session/list', cookie, { args: { _request: {} } })
+    const j = parseJson(res)
+    const items = j.result !== undefined && j.result.value !== undefined ? j.result.value.items : []
+    return { status: res.status, ids: (items || []).map((item) => item.sessionId), body: res.body }
+  }
+  const bob = await listIds(bobCookie)
+  check('bob 看得到自己的组会话与私有会话',
+    bob.status === 200 && bob.ids.indexOf(groupSessionId) !== -1 && bob.ids.indexOf(privateSessionId) !== -1, bob.body)
+  const carol = await listIds(carolCookie)
+  check('组员看得到组会话、看不到别人的私有会话',
+    carol.status === 200 && carol.ids.indexOf(groupSessionId) !== -1 && carol.ids.indexOf(privateSessionId) === -1, carol.body)
+  const dave = await listIds(daveCookie)
+  check('组外用户看不到任何会话', dave.status === 200 && dave.ids.length === 0, dave.body)
+  const admin = await listIds(adminCookie)
+  check('管理员看得到全部会话',
+    admin.status === 200 && admin.ids.indexOf(groupSessionId) !== -1 && admin.ids.indexOf(privateSessionId) !== -1, admin.body)
+}
+// 直连路由：导出（读）按组放行，二进制上传（写）仅归属人
+{
+  const exportOf = async (cookie, id) => get('/api/session.export?sessionId=' + encodeURIComponent(id), cookie)
+  const uploadTo = async (cookie, id) => {
+    const res = makeRes()
+    server.emit('request', makeReq('POST', '/api/session/uploadFileBinary?sessionId=' + encodeURIComponent(id), cookie, 'binary'), res)
+    await settle()
+    for (let i = 0; i < 300 && res.ended !== true; i += 1) await new Promise((r) => setTimeout(r, 5))
+    return res
+  }
+  const owner = await exportOf(bobCookie, groupSessionId)
+  check('导出：归属人可读组会话', owner.status === 200, 'status=' + owner.status)
+  const mate = await exportOf(carolCookie, groupSessionId)
+  check('导出：组员可读组会话（读谓词与 Remote 面一致）', mate.status === 200, 'status=' + mate.status)
+  const outsider = await exportOf(daveCookie, groupSessionId)
+  check('导出：组外用户 403', outsider.status === 403, 'status=' + outsider.status)
+  const privatePeek = await exportOf(carolCookie, privateSessionId)
+  check('导出：组员读不到别人的私有会话 403', privatePeek.status === 403, 'status=' + privatePeek.status)
+  const mateUpload = await uploadTo(carolCookie, groupSessionId)
+  check('上传：组员不得写入他人会话 403（组内可读≠可写）', mateUpload.status === 403, 'status=' + mateUpload.status)
+  const ownerUpload = await uploadTo(bobCookie, groupSessionId)
+  check('上传：归属人自己的会话放行到宿主', ownerUpload.status === 200, 'status=' + ownerUpload.status)
+  const adminUpload = await uploadTo(adminCookie, groupSessionId)
+  check('上传：管理员对他人会话同样只读 403', adminUpload.status === 403, 'status=' + adminUpload.status)
+}
+// 管理员「按用户浏览会话」要能看出会话属于哪个组/工作区
+{
+  const res = await post('/auth/rpc/adminSessionsByUser', adminCookie, '{}')
+  const j = parseJson(res)
+  const rows = (j.users || []).flatMap((u) => u.sessions)
+  const groupRow = rows.filter((row) => row.id === groupSessionId)[0]
+  const privateRow = rows.filter((row) => row.id === privateSessionId)[0]
+  check('管理员会话列表标出组与工作区',
+    groupRow !== undefined && groupRow.groupId === groupId && groupRow.group === '项目 A2'
+    && groupRow.workspaceId === groupWorkspaceId, res.body)
+  check('私有会话在管理员视图里不带组', privateRow !== undefined && privateRow.groupId === undefined, res.body)
+}
+{
+  const res = await post('/auth/rpc/adminSessionRead', adminCookie, JSON.stringify({ id: groupSessionId }))
+  const j = parseJson(res)
+  check('adminSessionRead 带组/工作区/归属',
+    j.ok === true && j.groupId === groupId && j.group === '项目 A2'
+    && j.workspaceId === groupWorkspaceId && j.owner === 'bob', res.body)
+}
+
 {
   const res = await post('/auth/rpc/deleteUser', adminCookie, JSON.stringify({ username: 'bob' }))
   check('deleteUser bob', parseJson(res).ok === true, res.body)
@@ -489,6 +783,12 @@ if (disposers.length > 0) {
   const file = fsFiles.get('dsh-ui-auth-groups-sessions.json')
   check('sess: 登录后会话文件已落盘', file !== undefined && file.includes('"sessions"'), 'file=' + (file !== undefined ? file.slice(0, 90) : '(missing)'))
   check('sess: 落盘不含明文 token（哈希化，64 位 hex key）', file !== undefined && !file.includes(cookie16) && /[0-9a-f]{64}/.test(file), 'file=' + (file !== undefined ? file.slice(0, 90) : '(missing)'))
+  // 归属表 v1 → v2 迁移：把磁盘上的归属记录退回 v1（只有 sessions/workspaces），
+  // 重启后必须照样读出来（旧数据 = 无组 = 私有），并在下一次写回时升到 v2 且不丢数据。
+  records.set('dsh-auth/ownership', {
+    kind: 'grant',
+    payload: JSON.stringify({ v: 1, sessions: { 'legacy-session': 'admin' }, workspaces: { 'legacy-workspace': 'admin' } }),
+  })
   // 模拟"重启"：新 server + 新 ctx（共享同一 credentials 与 fs 存储），再 apply 一次
   const serverR2 = new EventEmitter()
   serverR2.on('request', () => {})
@@ -512,6 +812,29 @@ if (disposers.length > 0) {
     setTimeout(() => resolve(r), 80)
   })
   check('sess: 重启后原 cookie 免登录恢复会话（me 200）', meRes.status === 200, 'status=' + meRes.status + ' body=' + meRes.body)
+  // v1 归属表仍然可读（未升级前不做任何改写）
+  {
+    const loaded = JSON.parse(records.get('dsh-auth/ownership').payload)
+    check('归属表：v1 payload 原样可读（不被初始化改写）',
+      loaded.v === 1 && loaded.sessions['legacy-session'] === 'admin', JSON.stringify(loaded))
+  }
+  // 一次写回（建组 + 删组会走解绑写入）之后必须升到 v2，且旧数据一条不丢、旧的组绑定为空（= 私有）
+  {
+    const rpcR = (method, body) => new Promise((resolve) => {
+      const r = makeRes()
+      serverR2.emit('request', makeReq('POST', '/auth/rpc/' + method, cookie16, JSON.stringify(body)), r)
+      setTimeout(() => resolve(r), 80)
+    })
+    const created = parseJson(await rpcR('createGroup', { name: '迁移组' }))
+    await rpcR('removeGroup', { id: created.group.id })
+    const migrated = JSON.parse(records.get('dsh-auth/ownership').payload)
+    check('归属表：写入后升到 v2 且保留 v1 数据',
+      migrated.v === 2 && migrated.sessions['legacy-session'] === 'admin'
+      && migrated.workspaces['legacy-workspace'] === 'admin', JSON.stringify(migrated))
+    check('归属表：旧数据没有组绑定（无组 = 私有）',
+      Object.keys(migrated.sessionGroups).length === 0 && Object.keys(migrated.workspaceGroups).length === 0,
+      JSON.stringify(migrated.sessionGroups))
+  }
   // 过期会话不恢复：把磁盘上的 expiresAt 改为过去，再"重启"
   const data = JSON.parse(file)
   for (const token of Object.keys(data.sessions)) data.sessions[token].expiresAt = 1
@@ -908,6 +1231,9 @@ if (disposers.length > 0) {
   const adminE2 = cookieOf(await callE('POST', '/auth/login', { username: 'admin', password: 'boot-pw-1234' }))
   await callE('POST', '/auth/rpc/changePassword', { oldPassword: 'boot-pw-1234', newPassword: adminPassword }, adminE2)
 }
+
+// 临时私有空间根目录清理（真实建过目录）
+try { rmSync(spacesRoot, { recursive: true, force: true }) } catch (error) { /* 清理尽力而为 */ }
 
 console.log(failures === 0 ? '\nALL HOST SMOKE TESTS PASSED' : `\n${failures} FAILURES`)
 process.exit(failures === 0 ? 0 : 1)

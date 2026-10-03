@@ -15,7 +15,7 @@
 import { build } from 'esbuild'
 import { readFile } from 'node:fs/promises'
 
-const ID = 'dsh-ui-auth'
+const ID = 'dsh-ui-auth-groups'
 const OUT = 'lib/client.js'
 const BROWSER_OUT = 'lib/passkey-browser.js'
 

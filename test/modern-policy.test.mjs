@@ -3,7 +3,18 @@ import assert from 'node:assert/strict'
 import { createModernPolicy } from '../lib/modern-policy.js'
 
 const alice = { username: 'alice', role: 'user' }
-const owners = { session: id => id === 'a' ? 'alice' : 'bob', workspace: id => id === 'wa' ? 'alice' : 'bob', sessionExists: async id => id !== 'new', claimSession: async () => {} }
+// 归属查询：本文件只验证上游面（无组），组相关查询一律回「无绑定/非成员」。
+const owners = {
+  session: id => id === 'a' ? 'alice' : 'bob',
+  workspace: id => id === 'wa' ? 'alice' : 'bob',
+  sessionGroup: () => undefined,
+  sessionWorkspace: () => undefined,
+  workspaceGroup: () => undefined,
+  isMember: () => false,
+  sessionExists: async id => id !== 'new',
+  claimSession: async () => {},
+  bindSession: async () => {},
+}
 const policy = createModernPolicy(owners)
 const request = value => ({ args: { request: value } })
 

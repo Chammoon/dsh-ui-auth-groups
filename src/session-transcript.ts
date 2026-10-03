@@ -157,6 +157,9 @@ export interface SessionRecordLike {
   persisted?: unknown
 }
 
+/** 面板条目上的附加标注（组/工作区绑定等；由调用方提供）。 */
+export type EntryAnnotator = (sessionId: string) => Partial<SessionEntry> | undefined
+
 /** 按用户分组的会话条目（面板用）。 */
 export interface SessionEntry {
   id: string
@@ -165,6 +168,12 @@ export interface SessionEntry {
   live: boolean
   persisted: boolean
   title?: string
+  /** 会话冻结的组 id（无 = 私有会话）。 */
+  groupId?: string
+  /** 组名（组已被删除时不出现）。 */
+  group?: string
+  /** 会话创建时所在的工作区 id。 */
+  workspaceId?: string
 }
 
 export interface UserSessions {
@@ -177,12 +186,14 @@ export interface UserSessions {
  *
  * - 未在归属表登记的会话由 `ownerOf` 决定（上游语义：未登记按 `admin` 处理）；
  * - 按创建时间倒序，用户按会话数倒序、同数按用户名排序；
- * - `titles` 是 `id -> 标题` 的旁路表（由调用方择机补齐，缺失就不显示标题）。
+ * - `titles` 是 `id -> 标题` 的旁路表（由调用方择机补齐，缺失就不显示标题）；
+ * - `annotate` 给每条条目补组/工作区等字段（返回 undefined 表示无附加信息）。
  */
 export function groupByOwner(
   records: readonly SessionRecordLike[],
   ownerOf: OwnerLookup,
   titles?: ReadonlyMap<string, string>,
+  annotate?: EntryAnnotator,
 ): UserSessions[] {
   const byUser = new Map<string, SessionEntry[]>()
   for (const record of records) {
@@ -199,6 +210,8 @@ export function groupByOwner(
     if (header !== undefined && typeof header.cwd === 'string' && header.cwd !== '') entry.cwd = header.cwd
     const title = titles?.get(id)
     if (title !== undefined && title !== '') entry.title = title
+    const extra = annotate?.(id)
+    if (extra !== undefined) Object.assign(entry, extra)
     const bucket = byUser.get(username)
     if (bucket === undefined) byUser.set(username, [entry])
     else bucket.push(entry)

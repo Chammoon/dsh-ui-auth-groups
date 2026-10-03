@@ -29,10 +29,22 @@ export interface Principal {
 
 /** Ownership queries and attribution used by the policy (supplied by `index.ts`). */
 export interface OwnershipLookup {
+  /** 会话归属人用户名（未登记为 `'admin'`）。 */
   session(id: string): string
+  /** 工作区归属人用户名（未登记为 `'admin'`）。 */
   workspace(id: string): string
+  /** 会话冻结的组绑定（`undefined` = 私有会话）。 */
+  sessionGroup(id: string): string | undefined
+  /** 会话创建时所在的工作区（用于 fork 继承与管理员视图）。 */
+  sessionWorkspace(id: string): string | undefined
+  /** 工作区绑定的组（`undefined` = 私有工作区）。 */
+  workspaceGroup(id: string): string | undefined
+  /** 成员关系查询：`username` 是否属于 `groupId`（同步、fail-closed）。 */
+  isMember(username: string, groupId: string): boolean
   sessionExists(id: string): Promise<boolean>
   claimSession(id: string, username: string): Promise<void>
+  /** 登记会话的工作区与组绑定（建会话 / fork 之后调用）。 */
+  bindSession(id: string, workspaceId: string | undefined, groupId: string | undefined): Promise<void>
 }
 
 /** Any decoded JSON object. */
@@ -120,7 +132,12 @@ export interface ModernPolicy {
   session(principal: Principal, id: unknown): boolean
   workspace(principal: Principal, id: unknown): boolean
   authorize(principal: Principal, endpoint: string, payload: unknown, stream?: boolean): Promise<boolean>
-  result(principal: Principal, endpoint: string, value: unknown): Promise<unknown>
+  /**
+   * 响应侧投影。
+   * @param payload - 同一请求的原始 wire payload；`session/create` / `session/fork`
+   *   靠它把新会话绑定到工作区与组（响应体里没有 workspaceId）。
+   */
+  result(principal: Principal, endpoint: string, value: unknown, payload?: unknown): Promise<unknown>
   frame(principal: Principal, endpoint: string, value: unknown, correlation: StreamCorrelation): unknown
 }
 
@@ -138,17 +155,6 @@ export interface ModernPolicyOptions {
    * 管理员从不受此限制。未提供该回调时行为与以前完全一致。
    */
   readonly entitlement?: (principal: Principal) => Promise<ModelEntitlement | undefined> | ModelEntitlement | undefined
-  /**
-   * 组可见性回调：`viewer` 与 `owner` 是否同属至少一个组（且非同一人）。
-   *
-   * 语义（组会话权限模型）：
-   * - 读：本人 + 同组 + 管理员；
-   * - 写：仅归属人本人（管理员对他人会话同样只读）。
-   *
-   * 未提供该回调时（或回调抛错时）一律视为「无组关系」，行为与上游完全一致 ——
-   * fail-closed，组存储故障绝不退化成「全员可读」。
-   */
-  readonly sharesGroup?: (viewer: string, owner: string) => boolean
 }
 
 /** provider 行/模型行的字段名在不同包里有 `id`/`provider`/`model` 等写法，这里做容错读取。 */
@@ -182,26 +188,45 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
     && scope.models.some(entry => entry.provider === provider && entry.model === model)
   const arrayOf = (value: unknown): unknown[] => (Array.isArray(value) ? value : [])
   /**
-   * 组可见性判定：viewer 与 owner 是否同组（且非同一人）。
-   * fail-closed —— 未接线、用户名非法或查询抛错一律视为不同组。
+   * 组成员判定：`username` 是否属于 `groupId`。
+   * fail-closed —— 未接线、id 非法或查询抛错一律视为不是成员。
    */
-  const shares = (viewer: string, owner: string): boolean => {
-    if (!nonempty(viewer) || !nonempty(owner) || viewer === owner) return false
+  const member = (username: string, groupId: unknown): boolean => {
+    if (!nonempty(username) || !nonempty(groupId)) return false
     try {
-      return options.sharesGroup?.(viewer, owner) === true
+      return owners.isMember(username, groupId) === true
     } catch {
       return false
     }
   }
   /**
-   * 会话「读」谓词：本人 + 同组 + 管理员。
+   * 组绑定查询（fail-closed）：未接线、形状不对或查询抛错一律视为**无绑定 = 私有**。
+   * 组存储故障绝不能退化成「组内可读」。
+   */
+  const binding = (lookup: (id: string) => string | undefined, id: string): string | undefined => {
+    try {
+      const value = lookup(id)
+      return nonempty(value) ? value : undefined
+    } catch {
+      return undefined
+    }
+  }
+  /**
+   * 可见性核心：管理员 ‖ 归属人本人 ‖ 对象绑定到查看者所在的组。
    *
-   * 全部列表/工作区/事件帧投影都调用它，因此组内共享会话会自动出现在
-   * 会话列表、工作区视图与实时事件流里，无需逐处改造。
+   * 注意这里**没有**「同组即可读」的兜底：一个没有组绑定的对象对组友不可见。
+   * 这正是「无组 = 私有」的实现点 —— 私有空间里的会话只属于本人与管理员。
+   */
+  const visible = (principal: Principal, owner: string, groupId: string | undefined): boolean =>
+    principal.role === 'admin' || owner === principal.username || member(principal.username, groupId)
+  /**
+   * 会话「读」谓词：绑定组 → 组内成员可读；无组 → 仅本人 + 管理员。
+   *
+   * 全部列表/工作区/事件帧投影都调用它，因此组会话会自动出现在会话列表、
+   * 工作区视图与实时事件流里，无需逐处改造。
    */
   const session = (principal: Principal, id: unknown): boolean =>
-    nonempty(id) && (principal.role === 'admin' || owners.session(id) === principal.username
-      || shares(principal.username, owners.session(id)))
+    nonempty(id) && visible(principal, owners.session(id), binding(owners.sessionGroup, id))
   /**
    * 会话「写」谓词：仅归属人本人。
    *
@@ -211,13 +236,27 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
    */
   const sessionWrite = (principal: Principal, id: unknown): boolean =>
     nonempty(id) && owners.session(id) === principal.username
-  /** 工作区「读」谓词：本人 + 同组 + 管理员（组会话因此能在侧栏被发现）。 */
+  /**
+   * 工作区「读」谓词：绑定组 → 组内成员可见（组会话因此能在侧栏被发现）；
+   * 无组 → 私有，仅本人 + 管理员。
+   */
   const workspace = (principal: Principal, id: unknown): boolean =>
-    nonempty(id) && (principal.role === 'admin' || owners.workspace(id) === principal.username
-      || shares(principal.username, owners.workspace(id)))
-  /** 工作区「写」谓词：沿用上游语义（本人 + 管理员），组员不得改写他人项目目录。 */
-  const workspaceWrite = (principal: Principal, id: unknown): boolean =>
+    nonempty(id) && visible(principal, owners.workspace(id), binding(owners.workspaceGroup, id))
+  /**
+   * 工作区「管理」谓词：归属人 + 管理员（改名 / 删除 / 排序）。
+   *
+   * 组工作区由部署方供给、组员只是借用（建会话），所以他们不能改名或删除别人的项目目录。
+   */
+  const workspaceManage = (principal: Principal, id: unknown): boolean =>
     nonempty(id) && (principal.role === 'admin' || owners.workspace(id) === principal.username)
+  /**
+   * 工作区「写」谓词：管理权 + **组工作区的组内成员**。
+   *
+   * 组工作区是项目空间，组员必须能在里面建会话（`session/create` 校验的就是它）；
+   * 会话内容仍是各写各的（{@link sessionWrite}）。
+   */
+  const workspaceWrite = (principal: Principal, id: unknown): boolean =>
+    nonempty(id) && (workspaceManage(principal, id) || member(principal.username, binding(owners.workspaceGroup, id)))
   const ownMap = (principal: Principal, value: unknown): JsonObject =>
     Object.fromEntries(Object.entries(object(value) ? value : {}).filter(([id]) => session(principal, id)))
   const workspaceValue = (principal: Principal, value: JsonObject): JsonObject => ({
@@ -248,6 +287,28 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
       return false
     }
     return session(principal, request.sessionId)
+  }
+
+  /**
+   * 从建会话请求推出新会话的绑定（工作区 + 组）。
+   *
+   * - `session/create`：工作区由客户端指定（策略层已按可写性校验过），组绑定取该工作区的绑定；
+   * - `session/fork`：继承源会话的工作区与组 —— 请求体与响应体都不带工作区信息。
+   *
+   * 解析不出时返回空绑定（= 私有），绝不猜测：宁可退回私有，也不默认共享。
+   */
+  function sessionBinding(endpoint: string, payload: unknown): { workspaceId?: string; groupId?: string } {
+    const args = payload === undefined ? undefined : remoteArgs(payload)
+    const request = args === undefined ? undefined : requestOf(args)
+    if (endpoint === 'session/create') {
+      const raw = request?.workspaceId
+      const workspaceId = nonempty(raw) ? raw : undefined
+      return { workspaceId, groupId: workspaceId === undefined ? undefined : binding(owners.workspaceGroup, workspaceId) }
+    }
+    const rawSource = request?.sessionId
+    const source = nonempty(rawSource) ? rawSource : undefined
+    if (source === undefined) return {}
+    return { workspaceId: binding(owners.sessionWorkspace, source), groupId: binding(owners.sessionGroup, source) }
   }
 
   return {
@@ -330,7 +391,8 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
         if (method === 'page' || method === 'follow') return authorizeSession(args, principal)
         if (method === 'create') {
           // A deployment-provisioned Workspace owns the location; a client cannot override it with cwd.
-          // 建会话只在**自己的**工作区（组共享是「读」而非「共写他人项目目录」）。
+          // 建会话只能落在自己的私有空间或自己所在组的组工作区里（组工作区的会话对组可见，
+          // 私有空间的会话只属于本人）—— 两者都由 workspaceWrite 判定，路径不可由客户端指定。
           if (!workspaceWrite(principal, request.workspaceId) || request.cwd !== undefined) return false
           if (request.sessionId === undefined) return true
           if (!nonempty(request.sessionId)) return false
@@ -355,7 +417,11 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
         // 归档他人的会话属于写动作。
         if (method === 'archiveSession') return sessionWrite(principal, request.sessionId)
         if (WORKSPACE_BY_ID.has(method as string)) {
-          if (!workspaceWrite(principal, request.workspaceId)) return false
+          // 改名/删除/工作区级排序是管理权；会话级排序沿用「能写这个工作区」。
+          const allowed = method === 'insertSessionBefore'
+            ? workspaceWrite(principal, request.workspaceId)
+            : workspaceManage(principal, request.workspaceId)
+          if (!allowed) return false
           if (request.beforeWorkspaceId !== undefined && !workspaceWrite(principal, request.beforeWorkspaceId)) return false
           return [request.sessionId, request.beforeSessionId].every(id => id === undefined || sessionWrite(principal, id))
         }
@@ -375,10 +441,15 @@ export function createModernPolicy(owners: OwnershipLookup, options: ModernPolic
       // Settings/credentials/plugins/presets/directory picking/dynamic Cordis stay administrator-only.
       return false
     },
-    async result(principal, endpoint, value) {
+    async result(principal, endpoint, value, payload) {
       const record = object(value) ? value : undefined
       if (record !== undefined && ['session/create', 'session/fork'].includes(endpoint) && nonempty(record.sessionId)) {
         await owners.claimSession(record.sessionId, principal.username)
+        // B1/B3：会话在创建时**冻结**工作区与组绑定 ——
+        // 在组工作区里建 → 会话属于该组（组内可读）；在私有空间里建 → 无组 = 私有。
+        // fork 继承源会话的绑定，源会话换组/换工作区不会把已有会话带走。
+        const binding = sessionBinding(endpoint, payload)
+        await owners.bindSession(record.sessionId, binding.workspaceId, binding.groupId)
       }
       if (principal.role === 'admin') return value
       // R2：按登录用户裁剪模型目录与 provider 列表。

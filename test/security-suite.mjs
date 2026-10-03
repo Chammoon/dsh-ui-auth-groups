@@ -56,6 +56,10 @@ function makeRes() {
   const res = { headersSent: false, status: 0, headers: {}, body: '', destroyed: false }
   res.writeHead = (s, h) => { res.status = s; Object.assign(res.headers, h || {}); res.headersSent = true }
   res.setHeader = (k, v) => { res.headers[k] = v }
+  res.getHeaders = () => res.headers
+  res.removeHeader = (k) => { delete res.headers[k] }
+  res.on = () => res
+  res.once = () => res
   res.write = (b) => { res.body += (b === undefined ? '' : String(b)); return true }
   res.end = (b) => { if (b !== undefined) res.body += String(b); res.ended = true }
   res.destroy = () => { res.destroyed = true }

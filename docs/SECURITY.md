@@ -105,8 +105,12 @@
 ## 8. 审计清单（可直接执行）
 
 ```bash
-# 1) 全量回归（含安全套件 159 项、主机/客户端冒烟、客户端契约自检、i18n）
+# 1) 全量回归（安全套件 145 项 + 宿主集成 158 项 + 二开单测 46 例 + 客户端契约自检 + i18n）
 npm ci && npm test
+
+# 1b) 二开部分：私有空间 / 组工作区（路径穿越、幂等供给、宿主缺席 fail-closed）
+node test/spaces.test.mjs && node test/group-store.test.mjs
+node test/group-policy.test.mjs   # 权限矩阵：组内可读、无组=私有、建会话落点、绑定冻结
 
 # 2) 真实 DSH 0.2.0 实例上的端到端验收（38 项：登录门/载体桥接/Remote 授权/用户隔离/R2 阻断）
 node test/live-020-check.mjs          # 需要已启动的隔离实例与 admin 口令

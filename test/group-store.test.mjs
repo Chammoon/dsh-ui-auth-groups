@@ -1,5 +1,5 @@
 /**
- * 组存储单元测试：成员关系、同组判定、跨用户可见性、fail-closed、损坏隔离、账户删除联动。
+ * 组存储单元测试：成员关系（isMember）、跨用户可见性、fail-closed、损坏隔离、账户删除联动。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -31,35 +31,40 @@ test('组名规范化：去空白、拒绝空与超长', () => {
   assert.throws(() => normalizeGroupName('x'.repeat(65)), /at most/)
 })
 
-test('同组判定：一个用户可属于多个组，跨组不相通', async () => {
+test('成员判定：一个用户可属于多个组，跨组不相通', async () => {
   const store = new GroupStore(() => memoryFs())
   await store.load()
-  store.create({ name: '项目 A', members: ['alice', 'bob'] })
-  store.create({ name: '项目 B', members: ['alice', 'carol'] })
+  const a = store.create({ name: '项目 A', members: ['alice', 'bob'] })
+  const b = store.create({ name: '项目 B', members: ['alice', 'carol'] })
 
   // alice 同时在 A、B 两个组
   assert.deepEqual(store.groupsOf('alice').map((g) => g.name), ['项目 A', '项目 B'])
-  assert.equal(store.shares('alice', 'bob'), true)
-  assert.equal(store.shares('alice', 'carol'), true)
-  // bob 与 carol 没有共同组
-  assert.equal(store.shares('bob', 'carol'), false)
-  // 自己与自己不算「同组」（读谓词里本人另有分支）
-  assert.equal(store.shares('alice', 'alice'), false)
-  // 不在任何组里的用户
-  assert.equal(store.shares('dave', 'alice'), false)
+  assert.deepEqual(store.groupIdsOf('alice').sort(), [a.id, b.id].sort())
+  assert.equal(store.isMember('alice', a.id), true)
+  assert.equal(store.isMember('alice', b.id), true)
+  assert.equal(store.isMember('bob', a.id), true)
+  // 跨组不相通：bob 不在 B、carol 不在 A
+  assert.equal(store.isMember('bob', b.id), false)
+  assert.equal(store.isMember('carol', a.id), false)
+  // 不在任何组里的用户 / 非法 id
+  assert.equal(store.isMember('dave', a.id), false)
+  assert.equal(store.isMember('alice', ''), false)
+  assert.equal(store.isMember('', a.id), false)
+  assert.equal(store.isMember('alice', 'no-such-group'), false)
+  assert.deepEqual(store.groupIdsOf('dave'), [])
 })
 
 test('成员增删改查立即影响可见性', async () => {
   const store = new GroupStore(() => memoryFs())
   await store.load()
   const group = store.create({ name: '项目 A', members: ['alice'] })
-  assert.equal(store.shares('alice', 'bob'), false)
+  assert.equal(store.isMember('bob', group.id), false)
 
   store.setMembers(group.id, ['alice', 'bob'])
-  assert.equal(store.shares('alice', 'bob'), true)
+  assert.equal(store.isMember('bob', group.id), true)
 
   store.setMembers(group.id, ['alice'])
-  assert.equal(store.shares('alice', 'bob'), false)
+  assert.equal(store.isMember('bob', group.id), false)
 
   // 重复成员与空串会被清洗
   const again = store.setMembers(group.id, ['alice', 'alice', '', '  '])
@@ -73,9 +78,9 @@ test('账户删除：从所有组里摘除', async () => {
   store.create({ name: '项目 B', members: ['bob', 'carol'] })
 
   assert.equal(store.removeMemberEverywhere('bob'), 2)
-  assert.equal(store.shares('alice', 'bob'), false)
-  assert.equal(store.shares('carol', 'bob'), false)
-  assert.equal(store.shares('alice', 'carol'), false)
+  assert.equal(store.isMember('bob', store.list()[0].id), false)
+  assert.equal(store.isMember('bob', store.list()[1].id), false)
+  assert.deepEqual(store.groupIdsOf('bob'), [])
   assert.deepEqual(store.groupsOf('bob'), [])
 })
 
@@ -90,17 +95,20 @@ test('落盘与重载：成员关系跨重启存活', async () => {
   const second = new GroupStore(() => fs)
   await second.load()
   assert.equal(second.list().length, 1)
-  assert.equal(second.shares('alice', 'bob'), true)
+  assert.equal(second.isMember('alice', second.list()[0].id), true)
+  assert.equal(second.isMember('bob', second.list()[0].id), true)
+  assert.equal(second.isMember('carol', second.list()[0].id), false)
 })
 
-test('fail-closed：fs 不可用 / 文件缺失时是空组表，绝不误判为同组', async () => {
+test('fail-closed：fs 不可用 / 文件缺失时是空组表，绝不误判为成员', async () => {
   const noFs = new GroupStore(() => undefined)
   await noFs.load()
-  assert.equal(noFs.shares('alice', 'bob'), false)
+  assert.equal(noFs.isMember('alice', 'g1'), false)
 
   const emptyFs = new GroupStore(() => memoryFs())
   await emptyFs.load()
-  assert.equal(emptyFs.shares('alice', 'bob'), false)
+  assert.equal(emptyFs.isMember('alice', 'g1'), false)
+  assert.deepEqual(emptyFs.groupIdsOf('alice'), [])
 })
 
 test('fail-closed：损坏文件被隔离成 .corrupt 副本并重置为空组表', async () => {
@@ -109,7 +117,7 @@ test('fail-closed：损坏文件被隔离成 .corrupt 副本并重置为空组�
   await store.load()
 
   assert.deepEqual(store.list(), [])
-  assert.equal(store.shares('alice', 'bob'), false)
+  assert.equal(store.isMember('alice', 'g1'), false)
   const quarantined = [...fs.files.keys()].filter((key) => key.startsWith(`${FILE}.corrupt-`))
   assert.equal(quarantined.length, 1, '应保留一份取证副本')
   assert.equal(fs.files.get(quarantined[0]), '{ not json')
@@ -131,7 +139,8 @@ test('删除组后成员关系一并清理', async () => {
   await store.load()
   const group = store.create({ name: '项目 A', members: ['alice', 'bob'] })
   store.remove(group.id)
-  assert.equal(store.shares('alice', 'bob'), false)
+  assert.equal(store.isMember('alice', group.id), false)
+  assert.equal(store.isMember('bob', group.id), false)
   assert.deepEqual(store.groupsOf('alice'), [])
   assert.throws(() => store.remove(group.id), /not found/)
 })
