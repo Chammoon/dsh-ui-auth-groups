@@ -689,6 +689,36 @@ let clientMintedSessionId
   const res = await callApi('session/create', bobCookie, { args: { request: { workspaceId: bobWorkspaceId, sessionId: 'cold-session-1' } } })
   check('自带冷会话 id（仅存在于持久化）：拒绝', res.status === 403, res.body)
 }
+// 会话可写状态查询（前端只读标记/输入拦截用）：只回答调用者本来就能读的会话
+let carolGroupSessionId
+{
+  const res = await callApi('session/create', carolCookie, { args: { request: { workspaceId: groupWorkspaceId } } })
+  const j = parseJson(res)
+  carolGroupSessionId = j.result !== undefined && j.result.value !== undefined ? j.result.value.sessionId : undefined
+  check('组员在组工作区里建会话（carol）', res.status === 200 && typeof carolGroupSessionId === 'string', res.body)
+}
+{
+  const accessOf = async (cookie, ids) => {
+    const res = await post('/auth/rpc/sessionAccess', cookie, JSON.stringify({ ids: ids }))
+    return { status: res.status, access: (parseJson(res) || {}).access || {}, body: res.body }
+  }
+  const bob = await accessOf(bobCookie, [privateSessionId, groupSessionId, carolGroupSessionId, 'cold-session-1', '', 'x'.repeat(200)])
+  check('可写状态：自己的私有会话可写', bob.access[privateSessionId] !== undefined
+    && bob.access[privateSessionId].writable === true && bob.access[privateSessionId].owner === 'bob', bob.body)
+  check('可写状态：组员的会话对组友是只读（带组名与归属）', bob.access[carolGroupSessionId] !== undefined
+    && bob.access[carolGroupSessionId].writable === false && bob.access[carolGroupSessionId].owner === 'carol'
+    && bob.access[carolGroupSessionId].group === '项目 A2', bob.body)
+  check('可写状态：读不到的会话不回任何字段（不是归属预言机）',
+    bob.access['cold-session-1'] === undefined && bob.access[''] === undefined && bob.access['x'.repeat(200)] === undefined, bob.body)
+  const carol = await accessOf(carolCookie, [carolGroupSessionId, groupSessionId])
+  check('可写状态：自己的组会话可写', carol.access[carolGroupSessionId] !== undefined
+    && carol.access[carolGroupSessionId].writable === true && carol.access[carolGroupSessionId].group === '项目 A2', carol.body)
+  const dave = await accessOf(daveCookie, [carolGroupSessionId])
+  check('可写状态：组外用户拿不到该会话（保持不可见）', dave.access[carolGroupSessionId] === undefined, dave.body)
+  const admin = await accessOf(adminCookie, [carolGroupSessionId])
+  check('可写状态：管理员可读但不可写（前端同样标记为只读）', admin.access[carolGroupSessionId] !== undefined
+    && admin.access[carolGroupSessionId].writable === false && admin.access[carolGroupSessionId].owner === 'carol', admin.body)
+}
 // 管理员「按用户浏览会话」要能看出会话属于哪个组/工作区
 {
   const res = await post('/auth/rpc/adminSessionsByUser', adminCookie, '{}')

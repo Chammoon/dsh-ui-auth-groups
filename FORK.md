@@ -84,8 +84,8 @@
 | `src/session-transcript.ts` | **新增**：会话事件流 → 只读转录（纯函数：正文提取、标题折叠、按归属分组 + 组/工作区标注） | 226 行 |
 | `src/modern-policy.ts` | 谓词按「对象所属组」判定：`session` / `workspace` 读谓词 + `sessionWrite` / `workspaceWrite` / `workspaceManage` 分离；`conversationWriteTarget()` 把「仅本人可写」提到**管理员直通之前**；`result(..., payload)` 在建会话/fork 时冻结工作区与组绑定；`confinePaths` 对工作区文件读取做路径收敛 | 224 行 |
 | `src/modern-gateway.ts` | `ModernAuth` 增加组查询/绑定/收敛接缝；`policy.result` 传入请求 payload；直连路由拆分：`/api/session.export` 用策略**读**谓词（组内可读），`/api/session/uploadFileBinary` 仍是**仅归属人**（组内可读 ≠ 可写）；query 上的 `sessionId` 重复参数一律拒绝（宿主 `Object.fromEntries` 取最后一个，与 `get()` 分叉）；`session/create` 带他人 id 时合成宿主同款 `session/writer-held` | 84 行 |
-| `src/index.ts` | 归属表 v2（组绑定/私有空间）+ 串行化写入与回滚；空间供给接线；登录/注册时供给；6 个组 RPC + **6 个工作区/空间 RPC**；**2 个会话浏览 RPC**；文件读取收敛接线（`confinePaths`）；`sessionExists` 同时支持 0.2.0 的 `stat` 与旧 `inspect`；标题 TTL 缓存；审计 | 697 行 |
-| `src/client.ts` | 设置面板「组（项目）」分区（管理员 CRUD + 组工作区绑定/创建/解绑、私有空间卡片）+「按用户浏览会话」分区（组标签与组筛选） | 430 行 |
+| `src/index.ts` | 归属表 v2（组绑定/私有空间）+ 串行化写入与回滚；空间供给接线；登录/注册时供给；6 个组 RPC + **6 个工作区/空间 RPC** + **1 个可写状态 RPC**（`sessionAccess`）；**2 个会话浏览 RPC**；文件读取收敛接线（`confinePaths`）；`sessionExists` 同时支持 0.2.0 的 `stat` 与旧 `inspect`；标题 TTL 缓存；审计 | 715 行 |
+| `src/client.ts` | 设置面板「组（项目）」分区（管理员 CRUD + 组工作区绑定/创建/解绑、私有空间卡片）+「按用户浏览会话」分区（组标签与组筛选）；**只读会话的前端标记**：`ctx.conversation.blocks` 禁用他人会话的输入框 + 会话头「只读」药丸 + 侧栏小锁 | 585 行 |
 | `test/spaces.test.mjs` | **新增**：目录清洗/去重/穿越防护、`confinePath` 收敛、幂等供给、宿主缺席 fail-closed（14 例） | 250 行 |
 | `test/group-store.test.mjs` | **新增**：存储与成员判定（9 例） | 146 行 |
 | `test/group-policy.test.mjs` | **新增**：权限矩阵、建会话落点、投影、绑定冻结、文件读取收敛、fail-closed（17 例） | 290 行 |
@@ -106,6 +106,23 @@
 - `DSH_AUTH_CONFINE_FILES=0` 可关闭（默认开启）；
 - **残余**：工作区内的**符号链接**指向外部时仍会被读到（宿主 `fs.resolve` 会跟随）。
   要彻底堵住需要宿主在 `locateFile` 里改用 `fs.contains`（已在上游反馈过的方向）。
+
+### 只读会话：前端先拦，接口兜底
+
+写入权限只有本插件知道（DSH 宿主是单用户模型），所以前端标记的数据源是本插件的
+`/auth/rpc/sessionAccess`（只回答调用者**本来就能读**的会话，读不到的 id 不回任何字段）。
+拿到之后落到三处：
+
+| 位置 | 接缝 | 效果 |
+|---|---|---|
+| 输入框 | `ctx.conversation.blocks.set(sessionId, { reason })`（DSH 官方「让某个会话的输入变惰」接缝） | 输入框禁用，占位符 = 我们的原因文案；**请求不会发出** |
+| 会话头 | `conversation.session.header.utilities`（list，scope session） | 「🔒 只读」药丸，悬停显示「由谁创建 / 属于哪个项目」 |
+| 侧栏行 | `sidebar.session.row.leading`（list，scope root） | 一把小锁 |
+| 数据刷新 | `ctx.get('sessions').list` 订阅 + 60s 兜底轮询 | 列表变化即刷新可写状态（带 TTL 与在途去重） |
+
+- 宿主没有 `conversation` 服务（旧版本）时**自动降级**：只保留视觉标记，拦截仍由接口层完成；
+- 卸载时清掉自己设过的 block（`ctx.effect` 的清理里逐个 `set(id, undefined)`）；
+- 这只是**体验层**：接口层的 `sessionWrite` 仍然只认会话归属人 —— 前端被绕过也写不进去。
 
 ### 建会话：客户端自带 id（reuseBlank）
 
@@ -177,7 +194,7 @@ DSH 客户端点开一个工作区时会先找该工作区里的**空白会话**
    - `client.ts`：`GroupsPage` + `SessionsByUserPage` + `settings.section` 注册
      （`id: 'auth-groups'`, `order: 32`；`id: 'auth-sessions'`, `order: 33`）。
 3. `npm test` 必须全绿：上游 145 项安全断言 + `modern-policy` 19 例 + 本包新增 48 例
-   （spaces 14 / group-store 9 / group-policy 17 / session-transcript 8）+ 宿主集成 175 项。
+   （spaces 14 / group-store 9 / group-policy 17 / session-transcript 8）+ 宿主集成 182 项 + 客户端行为断言 47 项。
 
 未接线组功能时（组表为空、归属表里没有任何组绑定）行为与上游一致：一切都是私有的，
 这条由 `test/group-policy.test.mjs` 的「未接线组功能时行为与上游一致」用例固化。

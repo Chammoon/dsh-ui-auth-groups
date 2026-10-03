@@ -3173,6 +3173,27 @@ const COOKIE_NAME = 'dsh_auth_' + (() => {
           sendJson(res, 200, { ok: true, group: groupView(group) })
           return
         }
+        // ============ 会话的「可写/只读」查询（前端标记与输入拦截用） ============
+        // 前端据此把不属于自己的会话标成只读（并拦住输入框），而不是等用户敲完发出
+        // 请求才在接口层被拒。**只是体验层**：写入判定仍在策略层（sessionWrite 仅认归属人）。
+        // 只回答「调用者本来就能读」的会话：读不到的 id 一个字段都不回，避免变成归属预言机。
+        case 'sessionAccess': {
+          const requested = Array.isArray(args.ids) ? args.ids : []
+          const access: Record<string, { writable: boolean; owner: string; group: string | null }> = {}
+          for (const raw of requested.slice(0, 200)) {
+            const id = typeof raw === 'string' ? raw.trim() : ''
+            if (id === '' || id.length > 128) continue
+            const owner = ownerOfSession(id)
+            const groupId = sessionGroupOf(id)
+            const visible = me.role === 'admin' || owner === who
+              || (groupId !== undefined && groups.isMember(who, groupId))
+            if (!visible) continue
+            const group = groupId === undefined ? undefined : groups.get(groupId)
+            access[id] = { writable: owner === who, owner, group: group === undefined ? null : group.name }
+          }
+          sendJson(res, 200, { ok: true, access })
+          return
+        }
         // ============ 管理员：按用户浏览会话（只读） ============
         // 管理员的阅读权限由策略层放行（读=本人+同组+管理员），这里只做数据整形：
         // 枚举全部会话 → 按归属人分组 → 需要时投影成只读转录。写入不在这里、也不可能在这里。

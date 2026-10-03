@@ -160,9 +160,26 @@
 			label: () => string
 		}
 		/** 客户端 slots 服务（本文件只用这两个方法）。 */
+		/** 座位注册的公共字段（除 settings.section 外都不需要 label）。 */
+		interface SlotEntryOptions {
+			name: string
+			id?: string
+			order?: number
+			priority?: number
+		}
+		/** `ctx.get('sessions')` 的会话列表 store 结构面（形状不认时不使用）。 */
+		interface SessionListStoreLike {
+			getSnapshot?(): { ids?: string[]; byId?: Record<string, unknown> } | undefined
+			subscribe?(listener: () => void): () => void
+		}
+		/** `ctx.conversation.blocks`：DSH 官方「让某个会话的输入变惰」接缝。 */
+		interface ConversationBlocksLike {
+			set(sessionId: string, block: { reason: string } | undefined): void
+		}
 		interface SlotsService {
-			inject(name: string, callback: () => void): void
+			inject(name: string, callback: () => unknown): unknown
 			register(options: SettingsSectionOptions, render: () => unknown): unknown
+			register(options: SlotEntryOptions, render: (...args: any[]) => unknown): unknown
 		}
 		/** Cordis 插件上下文（本文件只用 `ctx.get`）。 */
 		interface PluginContext {
@@ -243,6 +260,9 @@
 			'.dshua .field > label{margin:0 0 4px;font-size:12px;color:var(--dsw-alias-label-secondary)}',
 			'.dshua .muted{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:20px}',
 			'.dshua input,.dshua select{min-width:120px}',
+			// 只读会话标记（会话头 / 侧栏行 / 输入框上方）
+			'.dshua-ro{display:inline-flex;align-items:center;gap:4px;font-size:11px;line-height:16px;padding:1px 6px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2,#2a2f3a);color:var(--dsw-alias-label-secondary,#aab2c3);white-space:nowrap;cursor:default}',
+			'.dshua-ro-lock{font-size:11px;line-height:1;cursor:default;opacity:.9}',
 		].join('')
 
 		function injectAuthCss() {
@@ -1791,6 +1811,201 @@
 			try { sessionStorage.setItem('dshua-totp-reminded', '1') } catch (e) { /* ignore */ }
 		}
 
+		// ============ 只读会话：前端标记 + 输入拦截 ============
+		/**
+		 * 「这个会话不属于我」的知识只有本插件有（DSH 宿主是单用户模型），所以由本插件的
+		 * `/auth/rpc/sessionAccess` 提供，并由这里落到三处前端标记：
+		 *
+		 * 1. `ctx.conversation.blocks`（DSH 官方接缝：「另一个插件让某个会话的输入变惰」）——
+		 *    非归属人的会话输入框直接禁用，并把原因作为占位符显示，**请求根本不会发出去**；
+		 * 2. 会话头 utilities 座位：一个「只读」药丸；
+		 * 3. 侧栏会话行 leading 座位：一把小锁。
+		 *
+		 * 这只是体验层：接口层（策略层 `sessionWrite`）仍然只认会话归属人，前端被绕过也不会写入。
+		 */
+		var ACCESS_TTL_MS = 60 * 1000
+		var accessMap: Record<string, { writable: boolean; owner: string; group: string | null }> = {}
+		var accessQueriedAt: Record<string, number> = {}
+		var accessInflight: Record<string, boolean> = {}
+		var accessBlocked: Record<string, boolean> = {}
+		var accessListeners: Array<() => void> = []
+		var guardCtx: PluginContext | undefined
+		var guardTimer: ReturnType<typeof setInterval> | undefined
+
+		function notifyAccess(): void {
+			accessListeners.slice().forEach(function (listener) { try { listener() } catch (e) { /* ignore */ } })
+		}
+		function subscribeAccess(listener: () => void): () => void {
+			accessListeners.push(listener)
+			return function () { accessListeners = accessListeners.filter(function (item) { return item !== listener }) }
+		}
+		function accessText(zh: string, en: string): string {
+			return activeLocale === 'en' ? en : zh
+		}
+		function readOnlyReason(state: { owner: string; group: string | null }): string {
+			var who = state.owner === '' ? accessText('其他用户', 'another user') : state.owner
+			return state.group === null || state.group === undefined
+				? accessText('只读会话：由 ' + who + ' 创建，你只能查看', 'Read-only session: created by ' + who)
+				: accessText('只读会话：' + state.group + ' 的项目会话（由 ' + who + ' 创建），你只能查看',
+					'Read-only session: ' + state.group + ' project session created by ' + who)
+		}
+		/** DSH 的输入拦截接缝；宿主没提供（旧版本）时返回 null，只保留视觉标记。 */
+		function composerBlocks(): ConversationBlocksLike | null {
+			try {
+				const service = guardCtx === undefined
+					? undefined
+					: guardCtx.get('conversation') as { blocks?: ConversationBlocksLike } | undefined
+				const blocks = service === undefined || service === null ? undefined : service.blocks
+				return blocks !== undefined && blocks !== null && typeof blocks.set === 'function' ? blocks : null
+			} catch (e) { return null }
+		}
+		/** 客户端会话列表 store（侧栏可见的会话 id 从这里来）。 */
+		function sessionListStore(): SessionListStoreLike | undefined {
+			try {
+				const sessions = guardCtx === undefined
+					? undefined
+					: guardCtx.get('sessions') as { list?: SessionListStoreLike } | undefined
+				return sessions === undefined || sessions === null ? undefined : sessions.list
+			} catch (e) { return undefined }
+		}
+		/** 把已知的可写状态落到输入框上（可写 → 清掉我们设置的 block）。 */
+		function applyComposerBlocks(): void {
+			const blocks = composerBlocks()
+			if (blocks === null) return
+			Object.keys(accessMap).forEach(function (id) {
+				var state = accessMap[id]
+				if (state.writable) {
+					if (accessBlocked[id] === true) { try { blocks.set(id, undefined) } catch (e) { /* ignore */ } accessBlocked[id] = false }
+					return
+				}
+				try { blocks.set(id, { reason: readOnlyReason(state) }); accessBlocked[id] = true } catch (e) { /* ignore */ }
+			})
+		}
+		/** 查询若干会话的可写状态（带 TTL 与在途去重；失败静默 —— 接口层仍然拦截）。 */
+		function ensureAccess(ids: string[]): void {
+			var want: string[] = []
+			var now = Date.now()
+			for (var i = 0; i < ids.length; i++) {
+				var id = ids[i]
+				if (typeof id !== 'string' || id === '') continue
+				if (accessInflight[id] === true) continue
+				var seen = accessQueriedAt[id]
+				if (seen !== undefined && now - seen < ACCESS_TTL_MS) continue
+				accessInflight[id] = true
+				accessQueriedAt[id] = now
+				want.push(id)
+			}
+			if (want.length === 0) return
+			rpc('sessionAccess', { ids: want }).then(function (j: any) {
+				var access = j.access !== undefined && j.access !== null ? j.access : {}
+				for (var i = 0; i < want.length; i++) {
+					var id = want[i]
+					delete accessInflight[id]
+					var entry = access[id]
+					// 宿主没回（读不到的会话 / 未登记）→ 视为可写：接口层仍会拒绝，不误伤正常使用。
+					accessMap[id] = entry === undefined || entry === null
+						? { writable: true, owner: '', group: null }
+						: { writable: entry.writable === true, owner: String(entry.owner || ''), group: entry.group === undefined ? null : entry.group }
+				}
+				applyComposerBlocks()
+				notifyAccess()
+			}).catch(function () {
+				for (var i = 0; i < want.length; i++) { delete accessInflight[want[i]]; delete accessQueriedAt[want[i]] }
+			})
+		}
+		/** 侧栏里当前可见的会话 id（客户端会话 store；形状不认识就返回空表）。 */
+		function visibleSessionIds(): string[] {
+			try {
+				const store = sessionListStore()
+				const snapshot = store !== undefined && typeof store.getSnapshot === 'function' ? store.getSnapshot() : undefined
+				if (snapshot === undefined || snapshot === null) return []
+				if (Array.isArray(snapshot.ids)) return snapshot.ids.slice(0, 200)
+				const byId = snapshot.byId
+				return byId !== undefined && byId !== null ? Object.keys(byId).slice(0, 200) : []
+			} catch (e) { return [] }
+		}
+		function refreshAccess(): void {
+			var ids = visibleSessionIds()
+			if (ids.length === 0) return
+			ensureAccess(ids)
+		}
+		/** 会话头「只读」药丸（scope: session，props.sessionId）。 */
+		function ReadOnlyBadge(props: any): any {
+			var sessionId = props !== undefined && props !== null ? props.sessionId : undefined
+			var tick = React.useState(0)
+			React.useEffect(function () {
+				if (typeof sessionId === 'string' && sessionId !== '') ensureAccess([sessionId])
+				return subscribeAccess(function () { tick[1](function (n: number) { return n + 1 }) })
+			}, [sessionId])
+			var state = typeof sessionId === 'string' ? accessMap[sessionId] : undefined
+			if (state === undefined || state.writable) return null
+			return React.createElement('span', { className: 'dshua-ro', title: readOnlyReason(state) },
+				'🔒 ' + accessText('只读', 'Read-only'))
+		}
+		/** 侧栏会话行的锁（scope: root，props.sessionId）。 */
+		function ReadOnlyRowLock(props: any): any {
+			var sessionId = props !== undefined && props !== null ? props.sessionId : undefined
+			var tick = React.useState(0)
+			React.useEffect(function () {
+				if (typeof sessionId === 'string' && sessionId !== '') ensureAccess([sessionId])
+				return subscribeAccess(function () { tick[1](function (n: number) { return n + 1 }) })
+			}, [sessionId])
+			var state = typeof sessionId === 'string' ? accessMap[sessionId] : undefined
+			if (state === undefined || state.writable) return null
+			return React.createElement('span', { className: 'dshua-ro-lock', title: readOnlyReason(state) }, '🔒')
+		}
+		/** 注册只读标记：输入框拦截 + 会话头药丸 + 侧栏锁。 */
+		function installReadOnlyGuards(ctx: PluginContext): void {
+			guardCtx = ctx
+			var slots = ctx.get('slots')
+			if (slots === undefined) return
+			// 会话头标记（DSH 0.2.0 的 conversation.session.header.utilities 座位）
+			slots.inject('conversation.session.header.utilities', function () {
+				return slots!.register(
+					{ name: 'conversation.session.header.utilities', id: 'auth-readonly', order: 50 },
+					ReadOnlyBadge,
+				)
+			})
+			// 侧栏会话行的小锁
+			slots.inject('sidebar.session.row.leading', function () {
+				return slots!.register(
+					{ name: 'sidebar.session.row.leading', id: 'auth-readonly', order: 20 },
+					ReadOnlyRowLock,
+				)
+			})
+			// 会话列表变化 → 刷新可写状态；另外兜底轮询（列表为空时也能自愈）
+			try {
+				const store = sessionListStore()
+				const subscribe = store === undefined ? undefined : store.subscribe
+				if (subscribe !== undefined && ctx.effect !== undefined) {
+					let debounce: ReturnType<typeof setTimeout> | undefined
+					ctx.effect(function () {
+						return subscribe.call(store, function () {
+							if (debounce !== undefined) clearTimeout(debounce)
+							debounce = setTimeout(function () { refreshAccess() }, 400)
+						})
+					})
+				}
+			} catch (e) { /* 订阅失败只影响刷新时机 */ }
+			refreshAccess()
+			guardTimer = setInterval(function () { refreshAccess() }, ACCESS_TTL_MS)
+			if (ctx.effect !== undefined) {
+				ctx.effect(function () {
+					return function () {
+						if (guardTimer !== undefined) { clearInterval(guardTimer); guardTimer = undefined }
+						const blocks = composerBlocks()
+						if (blocks !== null) {
+							Object.keys(accessBlocked).forEach(function (id) {
+								if (accessBlocked[id] === true) { try { blocks.set(id, undefined) } catch (e) { /* ignore */ } }
+							})
+						}
+						accessBlocked = {}
+						guardCtx = undefined
+					}
+				})
+			}
+		}
+
 		// ============ 插件入口 ============
 		exports.name = 'dsh-ui-auth-groups'
 		// slots 服务在 0.1.1-rc.2 由 @deepseek-ai/dsh-client-runtime 提供，0.1.5 起改由
@@ -1930,6 +2145,7 @@
 			}
 			injectAuthCss()
 			mountSettings(ctx, 0)
+			installReadOnlyGuards(ctx)
 		}
 		// 即便宿主未按 inject 排序，也以有界重试等待服务就绪；始终取不到则明确报错，
 		// 不再静默不渲染（静默会让"菜单缺失"变成无法定位的故障）。
